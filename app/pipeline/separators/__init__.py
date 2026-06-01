@@ -6,6 +6,19 @@ from typing import Protocol, runtime_checkable
 
 from app.core.models import Job
 
+# Backend names the pipeline knows how to construct. Kept as plain strings
+# (no backend imports) so config validation can reference it without pulling
+# in any backend module. _make_backend() in separate.py is the matching
+# string -> instance dispatch; keep the two in sync when adding a backend.
+KNOWN_SEPARATOR_BACKENDS = frozenset({"demucs"})
+
+
+def is_known_backend(name: str) -> bool:
+    """Whether name is a backend the pipeline can construct. Used at startup
+    to warn about a misconfigured STEMDECK_SEPARATOR_BACKEND without blocking
+    boot (the hard failure still happens per-job in _make_backend)."""
+    return name in KNOWN_SEPARATOR_BACKENDS
+
 
 @dataclass
 class SeparationResult:

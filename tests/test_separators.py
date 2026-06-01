@@ -7,7 +7,12 @@ import pytest
 from app.core.models import Job, JobCancelled
 from app.core.registry import _procs, get_proc
 from app.pipeline import separate as separate_module
-from app.pipeline.separators import SeparationBackend, SeparationResult
+from app.pipeline.separators import (
+    KNOWN_SEPARATOR_BACKENDS,
+    SeparationBackend,
+    SeparationResult,
+    is_known_backend,
+)
 from app.pipeline.separators.demucs import DemucsBackend
 
 
@@ -37,6 +42,18 @@ def test_explicit_demucs_backend_selects_demucs():
 def test_unknown_backend_raises_clear_error():
     with pytest.raises(RuntimeError, match="unknown separation backend: bogus"):
         separate_module._make_backend("bogus")
+
+
+def test_is_known_backend_matches_make_backend():
+    """is_known_backend (used for the startup warning) and _make_backend (the
+    per-job hard failure) must agree on what's constructable, so a typo can't
+    pass the startup check yet fail at job time, or vice versa."""
+    assert is_known_backend("demucs")
+    assert not is_known_backend("bogus")
+    assert "demucs" in KNOWN_SEPARATOR_BACKENDS
+    for name in KNOWN_SEPARATOR_BACKENDS:
+        # Every advertised backend must actually construct.
+        assert isinstance(separate_module._make_backend(name), SeparationBackend)
 
 
 def test_demucs_backend_satisfies_protocol():

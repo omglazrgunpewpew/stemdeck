@@ -27,6 +27,7 @@ from app.core.config import (
 )
 from app.core.registry import restore as restore_registry
 from app.pipeline.collect import sweep_old_jobs
+from app.pipeline.separators import KNOWN_SEPARATOR_BACKENDS, is_known_backend
 
 # Show our INFO-level logs through uvicorn's root handler. Without this,
 # Python's default root level (WARNING) silently drops every
@@ -39,6 +40,16 @@ logging.getLogger("stemdeck").info(
     DEMUCS_MODEL,
     DEMUCS_DEVICE,
 )
+# Boot is deliberately not blocked on a bad backend name (see _make_backend),
+# but a typo would otherwise stay invisible until a job reaches the separate
+# stage and fails. Surface it loudly at startup instead.
+if not is_known_backend(SEPARATOR_BACKEND):
+    logging.getLogger("stemdeck").warning(
+        "STEMDECK_SEPARATOR_BACKEND=%r is not a known backend %s; "
+        "every job will fail at the separate stage",
+        SEPARATOR_BACKEND,
+        sorted(KNOWN_SEPARATOR_BACKENDS),
+    )
 
 configure_portable_environment()
 
