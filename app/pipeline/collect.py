@@ -10,18 +10,13 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from app.core.config import (
-    DEMUCS_MODEL,
-    JOB_TTL_SECONDS,
-    STEM_NAMES,
-    TIMEOUT_FFMPEG,
-    ffmpeg_executable,
-)
+from app.core.config import JOB_TTL_SECONDS, STEM_NAMES, TIMEOUT_FFMPEG, ffmpeg_executable
 from app.core.models import Job
 from app.core.registry import all_jobs as registry_all
 from app.core.registry import persist as registry_persist
 from app.core.registry import remove as registry_remove
 from app.core.registry import set_proc
+from app.pipeline.separators import SeparationResult
 
 logger = logging.getLogger("stemdeck.collect")
 
@@ -72,22 +67,31 @@ def _run_ffmpeg(job: Job, cmd: list[str]) -> bool:
 _TERMINAL = frozenset(("done", "error", "cancelled"))
 
 
-def collect(job: Job, stems_root: Path, job_dir: Path) -> list[str]:
-    """Move Demucs-emitted stems into the job's stems/ dir and clean up
-    the demucs intermediate dir. Does NOT delete the source download --
-    cleanup_source() is called by the runner after any post-processing
-    that needs to re-encode the source (e.g. building original.wav)."""
+def collect(job: Job, result: SeparationResult, job_dir: Path) -> list[str]:
+    """Move backend-emitted stems into the job's stems/ dir (in canonical
+    STEM_NAMES order) and remove the backend's intermediate paths. Decoupled
+    from any backend's on-disk layout -- it works only from result.stem_paths
+    and result.cleanup_paths.
+
+    Does NOT delete the source download -- cleanup_source() is called by the
+    runner after any post-processing that needs to re-encode the source
+    (e.g. building original.wav)."""
     target_dir = job_dir / "stems"
     target_dir.mkdir(exist_ok=True)
     found: list[str] = []
     for name in STEM_NAMES:
-        src = stems_root / f"{name}.wav"
-        if src.exists():
+        src = result.stem_paths.get(name)
+        # Re-check existence even though the backend reports only files it
+        # produced: keeps collect() robust to any backend whose listed path
+        # went missing between separate() and here, rather than trusting the
+        # contract blindly.
+        if src is not None and src.exists():
             shutil.move(str(src), target_dir / f"{name}.wav")
             found.append(name)
-    _rmtree(job_dir / DEMUCS_MODEL)
+    for path in result.cleanup_paths:
+        _rmtree(path)
     if not found:
-        raise RuntimeError("no stems produced by demucs")
+        raise RuntimeError(f"no stems produced by {result.backend}")
     return found
 
 

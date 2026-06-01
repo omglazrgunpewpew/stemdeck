@@ -68,6 +68,12 @@ FFPROBE_BIN = _env_path(
 )
 DEMUCS_MODEL = os.environ.get("STEMDECK_DEMUCS_MODEL", "htdemucs_6s").strip() or "htdemucs_6s"
 DEMUCS_DEVICE = _detect_device()
+# Which separation backend the pipeline dispatches to. Only "demucs" is
+# supported today; the value is validated when a job starts separating so a
+# typo doesn't prevent the server from booting.
+SEPARATOR_BACKEND = (
+    os.environ.get("STEMDECK_SEPARATOR_BACKEND", "demucs").strip().lower() or "demucs"
+)
 MAX_DURATION_SEC = max(60, _env_int("STEMDECK_MAX_DURATION_SEC", 1200))  # 20 min default
 JOB_TTL_SECONDS = max(300, _env_int("STEMDECK_JOB_TTL_SECONDS", 24 * 3600))  # 24 h default
 MAX_PENDING_JOBS = max(1, min(50, _env_int("STEMDECK_MAX_PENDING_JOBS", 3)))

@@ -59,6 +59,31 @@ def test_restore_recovers_orphan_done_job_from_stems(tmp_path: Path):
     assert {stem["name"] for stem in restored.stems} == {"vocals", "drums"}
 
 
+def test_recover_done_job_round_trips_separator_fields(tmp_path: Path):
+    """_recover_done_job must surface separator_backend/model written to
+    metadata.json so restored library entries match freshly-run jobs."""
+    job_dir = tmp_path / "abcdefabcdab"
+    stems_dir = job_dir / "stems"
+    stems_dir.mkdir(parents=True)
+    (stems_dir / "vocals.wav").write_bytes(b"RIFF")
+    (job_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "title": "Test Song",
+                "separator_backend": "demucs",
+                "separator_model": "htdemucs_6s",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restore_registry(tmp_path)
+
+    restored = _jobs["abcdefabcdab"]
+    assert restored.separator_backend == "demucs"
+    assert restored.separator_model == "htdemucs_6s"
+
+
 def test_restore_skips_orphan_without_metadata(tmp_path: Path):
     stems_dir = tmp_path / "abcdefabcde0" / "stems"
     stems_dir.mkdir(parents=True)

@@ -15,5 +15,10 @@ def test_health_endpoints_report_ok():
             assert body["status"] == "ok"
             assert body["version"]
             assert "ffmpeg_configured" in body
+            # New separator_backend key is additive; the demucs_* keys stay for
+            # backward compatibility.
+            assert body["separator_backend"] == "demucs"
+            assert "demucs_model" in body
+            assert "demucs_device" in body
             assert "jobs_dir" not in body
             assert "data_dir" not in body

@@ -87,8 +87,10 @@ def _run_common(job: Job, source: Path, job_dir: Path) -> None:
     _check_cancel(job)
     analyze(job, source)
     _check_cancel(job)
-    stems_root = separate(job, source, job_dir)
-    found = collect(job, stems_root, job_dir)
+    result = separate(job, source, job_dir)
+    job.separator_backend = result.backend
+    job.separator_model = result.model
+    found = collect(job, result, job_dir)
     stems_dir = job_dir / "stems"
     job.stem_presence = compute_stem_presence(stems_dir, found)
     # Source (100-300 MB or the local upload) is no longer needed after
@@ -146,6 +148,8 @@ def _write_metadata(job: Job, job_dir: Path) -> None:
         "tempo_stability": job.tempo_stability,
         "stem_presence": job.stem_presence,
         "tags": job.tags,
+        "separator_backend": job.separator_backend,
+        "separator_model": job.separator_model,
     }
     try:
         (job_dir / "metadata.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")

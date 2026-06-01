@@ -167,6 +167,8 @@ def _recover_done_job(job_dir: Path) -> Job | None:
         stem_presence=meta.get("stem_presence"),
         sections=meta.get("sections"),
         tags=meta.get("tags"),
+        separator_backend=meta.get("separator_backend"),
+        separator_model=meta.get("separator_model"),
     )
 
 

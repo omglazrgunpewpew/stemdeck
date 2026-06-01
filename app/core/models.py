@@ -52,6 +52,8 @@ class Job:
     selected_stems: list[str] = field(default_factory=list)
     mix_url: str | None = None  # populated when a strict subset was selected
     source_url: str | None = None  # original URL or "local:<filename>" for file uploads
+    separator_backend: str | None = None  # which backend produced the stems
+    separator_model: str | None = None  # backend model name (e.g. htdemucs_6s)
     error: str | None = None
     # Set by POST /api/jobs/{id}/cancel; consumed by pipeline stages.
     # Not surfaced via to_state() -- it's internal control state.
@@ -84,6 +86,8 @@ class Job:
             "selected_stems": self.selected_stems,
             "mix_url": self.mix_url,
             "source_url": self.source_url,
+            "separator_backend": self.separator_backend,
+            "separator_model": self.separator_model,
             "error": self.error,
             "created_at": self.created_at,
         }

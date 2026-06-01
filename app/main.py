@@ -20,6 +20,7 @@ from app.core.config import (
     DEMUCS_MODEL,
     FFMPEG_BIN,
     JOBS_DIR,
+    SEPARATOR_BACKEND,
     STATIC_DIR,
     configure_portable_environment,
     ensure_runtime_dirs,
@@ -32,7 +33,12 @@ from app.pipeline.collect import sweep_old_jobs
 # logger.info(...) call across the app, including the analyze
 # diagnostics ("chroma:", "key candidates:").
 logging.getLogger("stemdeck").setLevel(logging.INFO)
-logging.getLogger("stemdeck").info("demucs config: model=%s device=%s", DEMUCS_MODEL, DEMUCS_DEVICE)
+logging.getLogger("stemdeck").info(
+    "separation config: backend=%s model=%s device=%s",
+    SEPARATOR_BACKEND,
+    DEMUCS_MODEL,
+    DEMUCS_DEVICE,
+)
 
 configure_portable_environment()
 
@@ -144,6 +150,7 @@ def health() -> dict[str, object]:
         "status": "ok",
         "version": app_version(),
         "ffmpeg_configured": FFMPEG_BIN.is_file(),
+        "separator_backend": SEPARATOR_BACKEND,
         "demucs_model": DEMUCS_MODEL,
         "demucs_device": DEMUCS_DEVICE,
     }
