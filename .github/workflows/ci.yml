@@ -49,6 +49,14 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - run: for f in static/js/*.js; do node --check "$f"; done
 
+  rust-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup default stable
+      - run: cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml
+
   sast-bandit:
     runs-on: ubuntu-latest
     container:
