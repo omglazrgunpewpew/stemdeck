@@ -25,6 +25,10 @@
   --piano:  #a855f7;
   --other:  #9ca3af;
 
+  /* Width shared by the composer's two end segments (Song structure and
+     Split stems) so they match. See .daw-process-btn / .structure-toggle. */
+  --composer-action-w: 140px;
+
   /* Accent */
   --accent:   #f4b740;
   --accent-2: #d99a2b;
@@ -44,11 +48,22 @@
   --focus-ring:  rgba(236,236,236,0.55);
 
   /* Typography */
-  --font-sans: 'Inter', -apple-system, system-ui, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  /* Explicit CJK fallbacks for Japanese/Simplified Chinese (i18n, EN/PL/JA/ZH):
+     neither Inter nor JetBrains Mono carries CJK glyphs, so without these the
+     browser still substitutes automatically, just to whichever CJK font it
+     picks on its own -- naming one keeps weight/x-height consistent with the
+     Latin text sitting next to it across platforms, rather than leaving it to
+     chance. Never affects EN/PL text: browsers only reach past the first name
+     a glyph is missing from. */
+  --font-sans: 'Inter', -apple-system, system-ui, 'Hiragino Sans', 'Noto Sans JP', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, 'Hiragino Sans', 'Noto Sans JP', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', monospace;
 
   /* Layout */
   --header-w: 300px;
+  /* Width of the studio's left column: the stems/mixer panel, the label cell
+     above it, and the footer's blank gutter. One value, so the footer's
+     waveform strip stays aligned with the lane waveforms above it. */
+  --daw-col-w: 300px;
   --lane-h:   86px;
   --radius:   10px;
   --radius-sm: 8px;

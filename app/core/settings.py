@@ -5,10 +5,15 @@ at startup), so the Settings UI can change them without a restart:
 
 - `allow_network`     — whether StemDeck answers requests from other devices.
 - `max_duration_sec`  — longest track accepted for processing.
+- `jobs_dir`          — where extracted stems are written (needs a restart).
+- `playlist_max_items` — how many tracks one playlist import may queue.
 - `video_max_height`  — max video resolution for MP4 export / YouTube pulls.
 - `export_sample_rate` — sample rate for exported mixes/regions (WAV/FLAC/MP3).
 - `demucs_device`     — compute device for separation: auto | cuda | mps | cpu.
 - `separation_quality` — demucs shift-averaging: standard | best (2x slower).
+- `cookies_file`      — optional cookies.txt handed to yt-dlp for YouTube.
+- `auto_delete_jobs`  — whether finished jobs are deleted after a while (off).
+- `auto_delete_days`  — how long they are kept when that is on.
 
 Defaults fall back to the config.py constants (which honor their env vars), so
 nothing changes until the user overrides a value.
@@ -20,10 +25,14 @@ import json
 import logging
 import os
 import threading
+import time
+import uuid
+from pathlib import Path
 
 from app.core.config import (
     DATA_DIR,
     MAX_DURATION_SEC,
+    PLAYLIST_MAX_ITEMS,
     VIDEO_MAX_HEIGHT,
     available_torch_devices,
     detect_torch_device,
@@ -35,9 +44,13 @@ _SETTINGS_PATH = DATA_DIR / "settings.json"
 _LOCK = threading.RLock()
 _state: dict | None = None  # whole settings dict, loaded lazily
 
-# Clamp bounds. Max track length is capped at 20 min (the product ceiling).
-_DURATION_MIN, _DURATION_MAX = 60, 1200  # 1 min .. 20 min
+# Clamp bounds. Max track length is capped at 60 min (the product ceiling).
+_DURATION_MIN, _DURATION_MAX = 60, 3600  # 1 min .. 60 min
+# Published through /api/settings so the UI reads the ceiling rather than
+# keeping its own copy of it.
+DURATION_MIN_SEC, DURATION_MAX_SEC = _DURATION_MIN, _DURATION_MAX
 _HEIGHT_MIN, _HEIGHT_MAX = 144, 2160
+_PLAYLIST_MIN, _PLAYLIST_MAX = 1, 200
 _PORT_MIN, _PORT_MAX = 1024, 65535
 DEFAULT_PORT = 8000
 
@@ -59,16 +72,97 @@ def _default_allow_network() -> bool:
     return os.environ.get("STEMDECK_DESKTOP") != "1"
 
 
-def _load() -> dict:
+def _mirror_path() -> Path | None:
+    """Where the per-user copy lives, or None when the shell did not set one.
+
+    The path comes from the shell (STEMDECK_SETTINGS_MIRROR) so the platform
+    logic stays in one place -- see _mirror_settings."""
+    target = os.environ.get("STEMDECK_SETTINGS_MIRROR", "").strip()
+    return Path(target) if target else None
+
+
+def _read_json_dict(path: Path) -> dict | None:
+    """Parse `path` as a JSON object.
+
+    None means "there is nothing usable here" -- absent, unreadable, not JSON,
+    or JSON that is not an object. Callers that need to tell *absent* from
+    *unusable* must check existence themselves; that distinction is the whole
+    point of _load below."""
     try:
-        data = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        pass  # no settings file yet — first run; use defaults
+        return None
     except Exception:
-        # Corrupt/unreadable file: fall back to defaults rather than crash.
-        _log.warning("could not read settings from %s", _SETTINGS_PATH, exc_info=True)
+        _log.warning("could not read settings from %s", path, exc_info=True)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _atomic_write_json(path: Path, data: dict) -> bool:
+    """Write `data` to `path` so an interrupted write cannot destroy what was
+    there before.
+
+    write_text() truncates first and writes second, so a process that dies in
+    between leaves a file that exists and does not parse -- which _load then
+    could not distinguish from a first run, and the next setting change
+    persisted a one-key file over both this and the mirror (#509). Same
+    same-directory temp + replace the registry already uses; the temp name is
+    unique per call so two concurrent writers cannot interleave on it."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
+    except Exception:
+        _log.warning("could not persist settings to %s", path, exc_info=True)
+        return False
+    return True
+
+
+def _quarantine_corrupt(path: Path) -> None:
+    """Move an unusable settings file aside rather than leaving it to be
+    overwritten by the next save.
+
+    Renaming keeps the bytes for diagnosis. Deleting or writing over them
+    destroys the only remaining evidence of what the user had configured."""
+    try:
+        target = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+        path.replace(target)
+        _log.warning("settings at %s were unreadable; moved aside to %s", path, target)
+    except OSError:
+        _log.warning("could not move unreadable settings at %s aside", path, exc_info=True)
+
+
+def _load() -> dict:
+    """Read settings, telling "no file yet" apart from "file we cannot read".
+
+    Conflating the two is what lost real user settings: a torn write left an
+    unparsable file, this returned {} exactly as it would on a first run, and
+    the next set_*() then persisted a single key over both settings.json and
+    the mirror that existed to protect it."""
+    if not _SETTINGS_PATH.exists():
+        return {}  # no settings file yet — genuine first run; use defaults
+
+    data = _read_json_dict(_SETTINGS_PATH)
+    if data is not None:
+        return data
+
+    # The file is there but unusable. Preserve it, then try the per-user copy
+    # the shell keeps outside the install directory.
+    _quarantine_corrupt(_SETTINGS_PATH)
+    mirror = _mirror_path()
+    if mirror is not None:
+        recovered = _read_json_dict(mirror)
+        if recovered:
+            _log.warning("recovered settings from mirror %s", mirror)
+            # Put them back immediately. Without this the recovery only lasts
+            # until the next start, which would read a now-absent primary and
+            # silently fall back to defaults again.
+            _atomic_write_json(_SETTINGS_PATH, recovered)
+            return recovered
     return {}
 
 
@@ -76,17 +170,57 @@ def _ensure() -> dict:
     global _state
     if _state is None:
         _state = _load()
+        # Seed the per-user copy from settings that already exist. Mirroring
+        # only on _save() would protect nobody who configured StemDeck before
+        # this shipped and never opens Settings again -- their next install
+        # would still start empty. Safe against recursion (_state is assigned
+        # first) and against clobbering: an empty dict means a genuine first
+        # run, and overwriting a good copy with it is exactly the data loss
+        # this whole mechanism exists to prevent.
+        if _state:
+            _mirror_settings()
     return _state
 
 
-def _save() -> None:
-    try:
-        _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _SETTINGS_PATH.write_text(json.dumps(_ensure()), encoding="utf-8")
-    except Exception:
-        # Persistence is best-effort (read-only FS, permissions): the in-memory
-        # value still applies for this session, so don't fail the request.
-        _log.warning("could not persist settings to %s", _SETTINGS_PATH, exc_info=True)
+def _save() -> bool:
+    """Write settings.json. Best-effort for most settings (read-only FS,
+    permissions: the in-memory value still applies for this session, so a
+    caller here does not fail its request over it) -- but the write outcome
+    is still reported back, because one caller (set_jobs_dir) is coupled to
+    something irreversible enough that silently swallowing a failure there
+    would be actively misleading rather than merely inconvenient (#403)."""
+    if not _atomic_write_json(_SETTINGS_PATH, _ensure()):
+        return False
+    _mirror_settings()
+    return True
+
+
+def _mirror_settings() -> None:
+    """Keep a per-user copy of settings.json outside the install directory.
+
+    A Windows portable package keeps its data in `<app>/data` (#399), so
+    settings.json lives *inside the install*. Upgrading by extracting the new
+    zip to a fresh folder therefore started that install with no settings at
+    all: the stems location, port, compute device, quality and language were
+    all silently back to defaults, and a relocated library looked empty.
+
+    The desktop shell already restores from this copy -- `ensure_workspace`
+    seeds a fresh portable install from it before the backend ever reads
+    settings.json. Only the write half was missing, because #399 moved the
+    data directory and nothing took over writing the old location.
+
+    Best-effort by definition: this is a redundant copy, and failing to write
+    it must never fail the setting the user just changed. The path comes from
+    the shell (STEMDECK_SETTINGS_MIRROR) so the platform logic stays in one
+    place and both halves cannot drift apart.
+    """
+    path = _mirror_path()
+    if path is None:
+        return
+    # Same-directory temp + replace: a torn write here would be restored
+    # verbatim into the user's next install. _atomic_write_json also gives the
+    # temp file a unique name, so two writers cannot interleave on it.
+    _atomic_write_json(path, _ensure())
 
 
 def _num(v: object) -> int | None:
@@ -107,6 +241,108 @@ def set_allow_network(value: bool) -> bool:
         return bool(value)
 
 
+# ── auto_delete_jobs / auto_delete_days ──
+#
+# Whether finished jobs are deleted after a while, and after how long.
+#
+# Off unless the user says otherwise, and that direction is the whole point.
+# Deleting a finished separation destroys work that cannot be recovered, so the
+# behaviour of an install nobody has configured has to be "keep it". It used to
+# be the reverse: the sweep ran unless an environment variable switched it off,
+# which meant every documented way of starting StemDeck set that variable and
+# anyone who started the backend directly silently lost their library within a
+# day (#459).
+#
+# The stored setting wins over the environment, unlike jobs_dir where the env
+# pin wins. A mounted volume is not the user's to relocate; how long their own
+# work is kept is exactly their call, and StemDeck is single-user with no
+# separate operator to protect.
+_AUTO_DELETE_DAYS_MIN, _AUTO_DELETE_DAYS_MAX = 1, 365
+AUTO_DELETE_DAYS_MIN, AUTO_DELETE_DAYS_MAX = _AUTO_DELETE_DAYS_MIN, _AUTO_DELETE_DAYS_MAX
+DEFAULT_AUTO_DELETE_DAYS = 30
+
+
+def _default_auto_delete_jobs() -> bool:
+    """Only an explicit STEMDECK_PERSIST_LIBRARY=0 asks for deletion.
+
+    The variable reads as "persist the library", so 0 means "do not", which is
+    the one env-based way left to opt in. Unset, malformed, or 1 all mean keep,
+    so a deployment that forgets it loses nothing.
+    """
+    return os.environ.get("STEMDECK_PERSIST_LIBRARY", "").strip() == "0"
+
+
+def get_auto_delete_jobs() -> bool:
+    with _LOCK:
+        v = _ensure().get("auto_delete_jobs")
+        return v if isinstance(v, bool) else _default_auto_delete_jobs()
+
+
+def set_auto_delete_jobs(value: bool) -> bool:
+    with _LOCK:
+        _ensure()["auto_delete_jobs"] = bool(value)
+        _save()
+        return bool(value)
+
+
+def _default_auto_sections() -> bool:
+    """Automatic song-structure detection, off until the user asks for it.
+
+    The stage costs a CPU inference pass per job and produces suggestions
+    rather than ground truth, so nobody should pay for it without having
+    chosen to. STEMDECK_AUTO_SECTIONS=1 turns it on for a deployment that
+    wants it from first boot.
+    """
+    return os.environ.get("STEMDECK_AUTO_SECTIONS", "").strip() == "1"
+
+
+def get_auto_sections() -> bool:
+    with _LOCK:
+        v = _ensure().get("auto_sections")
+        return v if isinstance(v, bool) else _default_auto_sections()
+
+
+def set_auto_sections(value: bool) -> bool:
+    with _LOCK:
+        _ensure()["auto_sections"] = bool(value)
+        _save()
+        return bool(value)
+
+
+def _default_auto_delete_days() -> int:
+    """Honour a STEMDECK_JOB_TTL_SECONDS somebody already tuned.
+
+    That knob predates this setting and is in seconds, so it is converted and
+    clamped. A TTL shorter than a day becomes one day rather than none: the
+    control is in days now, and rounding someone's one-hour sweep down to zero
+    would turn a deliberately aggressive setting into a much slower one.
+    """
+    raw = os.environ.get("STEMDECK_JOB_TTL_SECONDS", "").strip()
+    if raw:
+        try:
+            days = round(int(raw) / 86400) or _AUTO_DELETE_DAYS_MIN
+        except ValueError:
+            return DEFAULT_AUTO_DELETE_DAYS
+        return max(_AUTO_DELETE_DAYS_MIN, min(_AUTO_DELETE_DAYS_MAX, days))
+    return DEFAULT_AUTO_DELETE_DAYS
+
+
+def get_auto_delete_days() -> int:
+    with _LOCK:
+        v = _num(_ensure().get("auto_delete_days"))
+        if v is None:
+            return _default_auto_delete_days()
+        return max(_AUTO_DELETE_DAYS_MIN, min(_AUTO_DELETE_DAYS_MAX, v))
+
+
+def set_auto_delete_days(value: int) -> int:
+    clamped = max(_AUTO_DELETE_DAYS_MIN, min(_AUTO_DELETE_DAYS_MAX, int(value)))
+    with _LOCK:
+        _ensure()["auto_delete_days"] = clamped
+        _save()
+        return clamped
+
+
 # ── max_duration_sec ──
 def get_max_duration_sec() -> int:
     with _LOCK:
@@ -118,6 +354,103 @@ def set_max_duration_sec(value: int) -> int:
     with _LOCK:
         clamped = max(_DURATION_MIN, min(_DURATION_MAX, int(value)))
         _ensure()["max_duration_sec"] = clamped
+        _save()
+        return clamped
+
+
+# ── jobs_dir ──
+# Where extracted stems are written. Read by config.py at import time (straight
+# from settings.json, to avoid importing this module from there), so a change
+# only takes effect on the next start -- which is also when the move that goes
+# with it has finished. Absent means "wherever the default puts it".
+def get_jobs_dir() -> str | None:
+    with _LOCK:
+        value = _ensure().get("jobs_dir")
+        return value if isinstance(value, str) and value.strip() else None
+
+
+def set_jobs_dir(value: str | None) -> tuple[str | None, bool]:
+    """Persist the jobs folder choice. Returns (resolved_value, persisted).
+
+    Unlike every other setting in this module, a failed persist here is not a
+    minor inconvenience: this is called only after move_library() has already
+    physically relocated the user's library (POST /api/settings/stems-location
+    in app/main.py), so quietly keeping the in-memory value "for this session"
+    and reporting success would mean the app comes back to the OLD (now-empty)
+    folder on the very next restart, with the real data sitting at a location
+    nothing points at any more (#403). The caller must check `persisted` and
+    tell the user the truth rather than assume a 200 means the choice stuck."""
+    with _LOCK:
+        if value is None or not str(value).strip():
+            _ensure().pop("jobs_dir", None)
+            return None, _save()
+        resolved = str(Path(str(value)).expanduser().resolve())
+        _ensure()["jobs_dir"] = resolved
+        return resolved, _save()
+
+
+# ── cookies_file ──
+# Path to a Netscape-format cookies.txt handed to yt-dlp as `cookiefile`.
+#
+# This exists because YouTube's bot check ("Sign in to confirm you're not a
+# bot") has no other remedy: yt-dlp ships no PO token generator, so an IP that
+# YouTube has flagged cannot import anything without credentials (#432).
+#
+# Deliberately a file path and not `cookiesfrombrowser`: reading a live browser
+# profile means touching the user's logged-in session on disk, and yt-dlp can
+# only do it reliably while that browser is closed. Exporting a cookies.txt is
+# an explicit, revocable act the user controls.
+#
+# Empty by default, and that matters. Supplying cookies makes yt-dlp skip every
+# client that does not support them, which removes the unauthenticated fallback
+# clients that work for most people today. Turning this on when you do not need
+# it makes imports worse, not better.
+def get_cookies_file() -> str | None:
+    with _LOCK:
+        value = _ensure().get("cookies_file")
+        return value if isinstance(value, str) and value.strip() else None
+
+
+def set_cookies_file(value: str | None) -> str | None:
+    """Persist the cookies.txt path, or clear it when given empty/None.
+
+    Raises ValueError when the path does not point at a readable file, so the
+    Settings UI can say so immediately rather than the user discovering it as a
+    failed import an hour later.
+    """
+    with _LOCK:
+        if value is None or not str(value).strip():
+            _ensure().pop("cookies_file", None)
+            _save()
+            return None
+        resolved = Path(str(value)).expanduser().resolve()
+        if not resolved.is_file():
+            raise ValueError("cookies file not found")
+        try:
+            with resolved.open("rb") as fh:
+                fh.read(1)
+        except OSError as e:
+            raise ValueError("cookies file is not readable") from e
+        _ensure()["cookies_file"] = str(resolved)
+        _save()
+        return str(resolved)
+
+
+# ── playlist_max_items ──
+# How many tracks one playlist import may queue. A waiting link costs a registry
+# record, so the ceiling is generous; the real reason to keep this adjustable is
+# that "import 200 tracks" is a decision about the user's evening, not about
+# resources.
+def get_playlist_max_items() -> int:
+    with _LOCK:
+        v = _num(_ensure().get("playlist_max_items"))
+        return max(_PLAYLIST_MIN, min(_PLAYLIST_MAX, v)) if v is not None else PLAYLIST_MAX_ITEMS
+
+
+def set_playlist_max_items(value: int) -> int:
+    with _LOCK:
+        clamped = max(_PLAYLIST_MIN, min(_PLAYLIST_MAX, int(value)))
+        _ensure()["playlist_max_items"] = clamped
         _save()
         return clamped
 

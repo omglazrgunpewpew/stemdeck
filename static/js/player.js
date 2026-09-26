@@ -1,8 +1,14 @@
 import Multitrack from "/vendor/multitrack.js";
 import { fmtTime } from "./utils.js";
+// job.js imports this module in turn. The cycle is pre-existing (catalog.js does
+// the same) and safe: these are only ever called from a callback, long after both
+// module bodies have run, and they close over DOM handles from dom.js rather than
+// job.js state.
+import { showPlaybackError, clearPlaybackError, resolvePlaybackSuccess } from "./job.js";
 import {
-  STEM_NAMES, TRACK_NAMES, STEM_COLORS, PROGRESS_COLOR,
+  STEM_NAMES, TRACK_NAMES, EXTRA_STEM_NAMES, STEM_COLORS, PROGRESS_COLOR,
   LOOP_DEFAULT_START_FRAC, LOOP_DEFAULT_END_FRAC, LANE_VOLUME_MAX,
+  effectiveStemOrder,
 } from "./constants.js";
 import {
   mixerEl, multitrackContainer, bpmChip, keyChip, stemsChip, timeEl,
@@ -16,22 +22,38 @@ import {
   setLoopEnabled, setLoopStart, setLoopEnd, setMasterVolume,
   waveScroll, selectedStems,
   footerTitle, footerMeta, footerThumb,
-  setFooterWaveDrawFn,
+  setFooterWaveDrawFn, setOverviewRerenderFn, autoSectionsResetFn,
+  metronome, setMetronome, metronomeEnabled, metronomeVolume, metronomeBeatsPerBar,
+  metronomeCountInBars, metronomeGrouping,
+  exportClickEl, exportClickWrap, exportCountInEl, exportCountInWrap,
+  setMetronomeHasBars,
 } from "./state.js";
 import { createAudioEngine, estimateDecodedBytes } from "./audioEngine.js";
 import { createChunkedAudioEngine } from "./chunkedAudioEngine.js";
+import { createPlaybackContext } from "./audioContext.js";
+import { effectivePitch } from "./pitchBus.js";
+import { addVisualOnlyStems, buildPlaybackStems } from "./playbackStems.js";
+import { vuLevel } from "./vuScale.js";
+import { createMetronome } from "./metronome.js";
+import { initBeatGrid, destroyBeatGrid } from "./beatgrid.js";
+import { setBeatGridAvailable, syncBeatGridButtons } from "./beatgridUi.js";
 import {
   loadMixIntoState, resetMixerState, refreshMixerVisuals,
   setLaneControlsEnabled, ensureMixerStateDefaults, applyMix,
   renderRealMiniWave, renderRealMiniWaveFromPeaks, renderMixerRow,
+  applyAllLanePitches, setLaneKeysAvailable,
 } from "./mixer.js";
 import {
   buildRuler, updatePlayheadMarker, updateLoopRegionVisual,
-  applyWaveZoom, buildPresenceRuler, updateFooterTimes,
-  updatePresencePlayhead, resetSpeed,
+  applyWaveZoom, resetWaveZoom, WAVE_ZOOM_MAX,
+  buildPresenceRuler, buildFooterWaveTicks, updateFooterTimes,
+  updatePresencePlayhead, resetSpeed, resetPitch, updatePitchAvailability,
+  updateMetronomeAvailability, applyMetronomeAccent,
 } from "./transport.js";
 import { stopVuLoop } from "./audio.js";
 import { destroySections } from "./sections.js";
+import { t, plural, onLanguageChange } from "./i18n.js";
+import { paintNowPlayingArt } from "./formatIcon.js";
 
 // Playback-engine selection. All engines play decoded AudioBuffers off a single
 // AudioContext clock (no N streaming <audio> elements — that was the source of
@@ -74,19 +96,32 @@ const _STEM_ROW_SELECTORS = [
 ];
 
 function applyStemSelectionFilter(presentNames) {
-  // Waveform rows: original hides if absent; STEM_NAMES rows always show, grayed if absent
+  // The order for THIS job: STEM_NAMES, with "vocals" swapped for
+  // lead_vocals + backing_vocals when the on-demand split (#275) produced
+  // both. Rows for a name outside `order` (the vocals-family row not in
+  // play for this job) are hidden outright, not just grayed "unavailable" --
+  // unlike the base 6, lead_vocals/backing_vocals aren't part of every job's
+  // contract, so there's no "not selected this time" state for them to be in.
+  const order = effectiveStemOrder(presentNames);
+  const isVocalFamily = (s) => s === "vocals" || s === "lead_vocals" || s === "backing_vocals";
+
+  // Waveform rows: original hides if absent; order rows always show, grayed if absent
   for (const el of document.querySelectorAll(".stem-waveform-row[data-stem]")) {
     const stem = el.dataset.stem;
     if (stem === "original") {
       el.classList.toggle("hidden", !presentNames.has(stem));
       el.classList.remove("unavailable");
+    } else if (isVocalFamily(stem)) {
+      const inOrder = order.includes(stem);
+      el.classList.toggle("hidden", !inOrder);
+      if (inOrder) el.classList.toggle("unavailable", !presentNames.has(stem));
     } else {
       el.classList.remove("hidden");
       el.classList.toggle("unavailable", !presentNames.has(stem));
     }
   }
   const originalRow = presentNames.has("original") ? 1 : 0;
-  const visibleTrackCount = originalRow + STEM_NAMES.length;
+  const visibleTrackCount = originalRow + order.length;
   const app = document.querySelector(".app");
   app?.style.setProperty("--visible-track-count", String(visibleTrackCount));
   app?.style.setProperty(
@@ -97,16 +132,21 @@ function applyStemSelectionFilter(presentNames) {
     for (const el of document.querySelectorAll(sel)) {
       const stem = el.dataset.stem
         || el.classList[0];  // .presence-labels span has no data-stem, use class
-      el.classList.toggle("hidden", !presentNames.has(stem));
+      // vocals/lead_vocals/backing_vocals are mutually exclusive rows for a
+      // given job (#275) -- whichever the split state doesn't call for stays
+      // hidden even if presentNames still has it (vocals.wav is never
+      // deleted by the split, so "present" alone can't decide this one).
+      const hidden = isVocalFamily(stem) ? !order.includes(stem) : !presentNames.has(stem);
+      el.classList.toggle("hidden", hidden);
     }
   }
   const visibleMixerNames = [];
   if (presentNames.has("original")) visibleMixerNames.push("original");
-  for (const name of STEM_NAMES) {
+  for (const name of order) {
     if (presentNames.has(name)) visibleMixerNames.push(name);
   }
-  const mixerCap = STEM_NAMES.length + (presentNames.has("original") ? 1 : 0);
-  for (const name of STEM_NAMES) {
+  const mixerCap = order.length + (presentNames.has("original") ? 1 : 0);
+  for (const name of order) {
     if (visibleMixerNames.length >= mixerCap) break;
     if (!visibleMixerNames.includes(name)) visibleMixerNames.push(name);
   }
@@ -114,8 +154,15 @@ function applyStemSelectionFilter(presentNames) {
 
   for (const row of document.querySelectorAll(".mixer-column .lane-header[data-stem]")) {
     const stem = row.dataset.stem;
+    const inOrder = stem === "original" ? presentNames.has("original") : order.includes(stem);
     const available = presentNames.has(stem);
-    row.classList.toggle("hidden", !visibleMixerSet.has(stem));
+    // Mixer rows are built once in renderEmptyShell (original, the base 6,
+    // then lead_vocals/backing_vocals tacked on at the end) and reused across
+    // every job load -- DOM order alone would always put lead_vocals/
+    // backing_vocals last. CSS order (.mixer-column is a column flexbox)
+    // repositions them to match `order` (right after "original") per job.
+    row.style.order = stem === "original" ? "-1" : String(order.indexOf(stem));
+    row.classList.toggle("hidden", !inOrder || !visibleMixerSet.has(stem));
     row.classList.toggle("unavailable", !available);
     row.setAttribute("aria-disabled", String(!available));
     for (const el of row.querySelectorAll("button, .lane-knob, .lane-dl")) {
@@ -132,9 +179,18 @@ function applyStemSelectionFilter(presentNames) {
     }
   }
   for (const row of document.querySelectorAll(".energy-row[data-stem]")) {
-    const available = presentNames.has(row.dataset.stem);
+    const stem = row.dataset.stem;
+    const available = presentNames.has(stem);
     row.classList.toggle("unavailable", !available);
-    row.classList.remove("hidden");
+    row.classList.toggle("hidden", isVocalFamily(stem) ? !order.includes(stem) : false);
+  }
+  // Presence cards, top row of the track header. Only the vocals family moves:
+  // the single "Global Vocals" card and the lead/backing pair are alternatives,
+  // never both, and the panel's column count depends on which is showing.
+  for (const card of document.querySelectorAll(".stem-presence-panel .stem-card[data-stem]")) {
+    const stem = card.dataset.stem;
+    if (!isVocalFamily(stem)) continue;
+    card.classList.toggle("hidden", !order.includes(stem));
   }
 }
 
@@ -183,9 +239,21 @@ function resetAnalysisCards() {
   if (loudnessCard) loudnessCard.classList.add("hidden");
 }
 
+/**
+ * The empty studio's lanes: one flat line per stem, where its waveform will be.
+ *
+ * STEM_NAMES only, deliberately. "original" used to be in this list, giving
+ * seven lanes against the six rows the mixer shows with no job loaded, because
+ * the mixer hides its original row until one is: `applyStemSelectionFilter` is
+ * called here with STEM_NAMES, and original is not in that set. Seven lines
+ * beside six faders drifted apart down the stack, and the last of them had no
+ * fader at all.
+ *
+ * The set the mixer shows is the set to draw, so the two are the same list.
+ */
 function renderPlaceholderTracks() {
   multitrackContainer.innerHTML = "";
-  for (const name of ["original", ...STEM_NAMES]) {
+  for (const name of STEM_NAMES) {
     const ph = document.createElement("div");
     ph.className = "lane-placeholder";
     ph.dataset.stem = name;
@@ -342,7 +410,7 @@ function waveformPath(peaks) {
   return `${top.join(" ")} ${bottom.join(" ")} Z`;
 }
 
-function renderOverviewWaveformPath(stemName, peaks, norm, color, barCount) {
+function renderOverviewWaveformPath(stemName, peaks, norm, color, barCount, orderIndex) {
   const layer = ensureOverviewWaveformLayer();
   let row = layer.querySelector(`[data-stem="${stemName}"]`);
   if (!row) {
@@ -352,7 +420,7 @@ function renderOverviewWaveformPath(stemName, peaks, norm, color, barCount) {
     layer.appendChild(row);
   }
   row.style.setProperty("--stem-color", color);
-  row.style.order = String(TRACK_NAMES.indexOf(stemName));
+  row.style.order = String(orderIndex);
   // A row is created for every mixer lane, including stems with no audio (e.g.
   // a subset extraction). The rows are flex-distributed across the lane stack,
   // so they only stay 1:1 with the mixer lanes when their count matches; an
@@ -369,17 +437,55 @@ function renderOverviewWaveformPath(stemName, peaks, norm, color, barCount) {
       ${barsWaveformSvg(peaks, norm, bars)}
     </svg>
   `;
+  addLaneDragNugget(row, stemName);
+}
+
+// The handle for dragging this lane's slice of the loop out. One per lane, so
+// which track a drag produces is a matter of looking at it rather than
+// remembering.
+//
+// Added after the art, not with the row: the row's innerHTML is rewritten on
+// every redraw and a zoom step is a redraw, so anything placed inside it when
+// the row was created is gone by the second wheel notch. Only lanes that drew
+// something get one; a lane with no audio has nothing to hand over.
+//
+// The waveform layer is pointer-events: none so it never swallows a click
+// meant for the loop underneath. The nugget puts its own back, in CSS.
+function addLaneDragNugget(row, stemName) {
+  const nugget = document.createElement("div");
+  nugget.className = "lane-drag-nugget";
+  nugget.dataset.laneDragOut = stemName;
+  nugget.draggable = true;
+  nugget.title = t("loop.dragOutStem", { name: t(`stem.${stemName}`) });
+  row.appendChild(nugget);
 }
 
 // The lane set must mirror the mixer/multitrack lanes (orderedNames in
 // wireUpAudio): "original" plus the stems when an original lane is present,
 // otherwise just the stems. Rendering a row for every lane keeps the overlay
-// aligned even when only a subset of stems was extracted.
+// aligned even when only a subset of stems was extracted. Swaps "vocals" for
+// lead_vocals + backing_vocals when this job's on-demand split (#275) ran.
 function overviewLaneNames(stems) {
-  return stems.some((s) => s.name === "original") ? TRACK_NAMES : STEM_NAMES;
+  const present = new Set(stems.map((s) => s.name));
+  const order = effectiveStemOrder(present);
+  return present.has("original") ? ["original", ...order] : order;
 }
 
+// What the overview bars were last drawn from, so a zoom change can redraw them
+// at the new resolution without reloading the track. Zoom widens .waves-column,
+// overviewBarCount() reads that width, and the bars come back the same 3px wide
+// with more of them -- redrawing is what keeps the art identical, where
+// stretching the same SVG would smear it.
+let _overviewSource = null;
+
+function rerenderOverviewWaveforms() {
+  if (!_overviewSource) return;
+  renderAllOverviewWaveformsFromPeaks(_overviewSource.stems, _overviewSource.data);
+}
+setOverviewRerenderFn(rerenderOverviewWaveforms);
+
 function renderAllOverviewWaveformsFromPeaks(stems, peaksData) {
+  _overviewSource = { stems, data: peaksData };
   const laneNames = overviewLaneNames(stems);
   // Only the extracted/selected stems (plus original) get a waveform, even if
   // peaks.json carries data for stems the user didn't keep (Demucs separates
@@ -398,10 +504,10 @@ function renderAllOverviewWaveformsFromPeaks(stems, peaksData) {
   }
   const norm = globalMax > 0 ? 1 / globalMax : 0;
   const bars = overviewBarCount();
-  for (const name of laneNames) {
+  laneNames.forEach((name, i) => {
     const pts = present.has(name) ? peaksData[name] : null;
-    renderOverviewWaveformPath(name, pts, norm, STEM_COLORS[name] || "#a0a0a0", bars);
-  }
+    renderOverviewWaveformPath(name, pts, norm, STEM_COLORS[name] || "#a0a0a0", bars, i);
+  });
 }
 
 // Normalize all stems to a single shared max so the overview waveforms
@@ -410,23 +516,19 @@ function renderAllOverviewWaveformsFromPeaks(stems, peaksData) {
 // fill its row regardless of how loud the stem actually was.
 function renderAllOverviewWaveforms(stems, decodedMap) {
   const laneNames = overviewLaneNames(stems);
-  const peaksByStem = new Map();
-  let globalMax = 0;
+  const peaksByStem = {};
   for (const name of laneNames) {
     const buf = decodedMap.get(name);
     if (!isAudioBufferLike(buf)) continue;
-    const peaks = bufferMinMaxPeaks(buf, OVERVIEW_WAVE_POINTS);
-    peaksByStem.set(name, peaks);
-    for (const [mn, mx] of peaks) {
-      if (mx > globalMax) globalMax = mx;
-      if (-mn > globalMax) globalMax = -mn;
-    }
+    // Scanned once per track, at the finest resolution any zoom will ask for.
+    // bufferMinMaxPeaks walks every sample, so doing this per zoom step would
+    // re-read the whole song per stem on each wheel notch. The bars are
+    // downsampled from this cache instead, which is what peaks.json already is
+    // -- the two sources are the same shape from here on, they just differ in
+    // how many points they carry.
+    peaksByStem[name] = bufferMinMaxPeaks(buf, OVERVIEW_WAVE_POINTS * WAVE_ZOOM_MAX);
   }
-  const norm = globalMax > 0 ? 1 / globalMax : 0;
-  const bars = overviewBarCount();
-  for (const name of laneNames) {
-    renderOverviewWaveformPath(name, peaksByStem.get(name), norm, STEM_COLORS[name] || "#a0a0a0", bars);
-  }
+  renderAllOverviewWaveformsFromPeaks(stems, peaksByStem);
 }
 
 function renderDecodedStemVisuals(stemName, audioBuffer, color) {
@@ -537,7 +639,10 @@ function buildStemVuEnvelope(audioBuffer) {
 function stemVuGain(stemName) {
   const state = mixerState[stemName];
   if (!state) return 0;
-  const anySolo = TRACK_NAMES.some((name) => trackIndex[name] !== undefined && mixerState[name]?.soloed);
+  // Derived from trackIndex (the lanes actually mounted for THIS job) rather
+  // than the fixed TRACK_NAMES, so a solo on a lead_vocals/backing_vocals
+  // lane (#275) is honored the same as any of the base 6.
+  const anySolo = Object.keys(trackIndex).some((name) => mixerState[name]?.soloed);
   if (state.muted || (anySolo && !state.soloed)) return 0;
   return Math.max(0, state.volume);
 }
@@ -620,12 +725,16 @@ function startStemVuLoop(stems, decodedMap, token) {
 function startAnalyserVuLoop(stems, engine, token) {
   stopStemVuLoop();
   const meters = stems.map((stem) => {
-    const analyser = engine.getAnalyser?.(stem.name);
-    if (!analyser) return null;
+    const analysers = engine.getAnalysers?.(stem.name)
+      ?? [engine.getAnalyser?.(stem.name)].filter(Boolean);
+    if (!analysers.length) return null;
     return {
       name: stem.name,
-      analyser,
-      data: new Uint8Array(analyser.fftSize),
+      analysers,
+      // Float rather than byte samples. On a dB scale the 8-bit path's own
+      // quantisation step, one part in 128, is -42 dBFS: it would light every
+      // meter to roughly a third of full even over silence.
+      data: analysers.map((analyser) => new Float32Array(analyser.fftSize)),
       miniMeterEl: document.querySelector(`.stem-list [data-stem="${stem.name}"] .mini-meter`),
       vuEl: mixerEl.querySelector(`.lane-vu[data-stem="${stem.name}"]`),
       peak: 0,
@@ -646,13 +755,18 @@ function startAnalyserVuLoop(stems, engine, token) {
       const gain = stemVuGain(m.name);
       let input = 0;
       if (playing && gain > 0) {
-        m.analyser.getByteTimeDomainData(m.data);
         let sum = 0;
-        for (let i = 0; i < m.data.length; i++) {
-          const v = (m.data[i] - 128) / 128;
-          sum += v * v;
+        let samples = 0;
+        for (let a = 0; a < m.analysers.length; a++) {
+          const analyser = m.analysers[a];
+          const data = m.data[a];
+          analyser.getFloatTimeDomainData(data);
+          samples = Math.max(samples, data.length);
+          for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
         }
-        input = Math.min(1, Math.sqrt(sum / m.data.length) * 2.5);
+        // Summed across the group's analysers, so a control group like
+        // "original" meters the power of everything it plays, not one source.
+        input = vuLevel(Math.sqrt(sum / Math.max(1, samples)));
       } else {
         m.peak = 0;
         m.peakHold = 0;
@@ -696,6 +810,19 @@ function startAnalyserVuLoop(stems, engine, token) {
   stemVuRafId = requestAnimationFrame(tick);
 }
 
+// The metronome holds nodes on the engine's unpitched bus, so it must never
+// outlive the engine that owns them. Called at every engine teardown site.
+function teardownMetronome() {
+  if (metronome) {
+    metronome.destroy();
+    setMetronome(null);
+  }
+  // Flushes any debounced save before dropping the grid, so switching tracks
+  // mid-edit never loses the last correction.
+  destroyBeatGrid();
+  setBeatGridAvailable(false);
+}
+
 export function destroyPlayer() {
   document.querySelector(".app")?.classList.remove("is-import");
   document.querySelector(".app")?.classList.remove("engine-waveforms");
@@ -704,6 +831,11 @@ export function destroyPlayer() {
   stopVuLoop();
   stopStemVuLoop();
   resetSpeed();
+  resetPitch();
+  updatePitchAvailability(false);
+  teardownMetronome();
+  updateMetronomeAvailability(null, t("click.reason.loadTrack"));
+  setExportClickAvailable(false);
   if (audioEngine) {
     audioEngine.destroy();
     setAudioEngine(null);
@@ -734,6 +866,8 @@ export function destroyPlayer() {
   applyStemSelectionFilter(new Set(STEM_NAMES));
   npThumb.classList.remove("loaded");
   npThumb.removeAttribute("src");
+  // Otherwise the empty studio keeps the last track's format in the square.
+  paintNowPlayingArt("");
 
   rulerTime.innerHTML = '<div class="playhead-marker" aria-hidden="true"><svg viewBox="0 0 10 10" width="10" height="10"><polygon points="0,0 10,0 5,8" fill="#e54e4e"></polygon></svg></div>';
   wavesGrid.innerHTML = "";
@@ -741,7 +875,7 @@ export function destroyPlayer() {
   titleEl.textContent = "";
   bpmChip.textContent = "\u2014 BPM";
   keyChip.textContent = "\u2014 \u2014";
-  stemsChip.textContent = "\u2014 Stems";
+  stemsChip.textContent = t("footer.stemsPlaceholder");
   timeEl.textContent = "00:00 / 00:00";
   resetAnalysisCards();
 
@@ -760,6 +894,7 @@ export function destroyPlayer() {
   setTrackIndex({});
   applyWaveZoom();
   buildPresenceRuler(0);
+  buildFooterWaveTicks(0);
   updateFooterTimes(0);
   updatePresencePlayhead(0);
   if (waveScroll) waveScroll.scrollLeft = 0;
@@ -784,22 +919,33 @@ export function renderEmptyShell() {
   stopStemVuLoop();
   ensureMixerStateDefaults();
   mixerEl.innerHTML = "";
-  for (const name of ["original", ...STEM_NAMES]) {
+  // lead_vocals/backing_vocals (#275) get rows too, built once here like the
+  // base 6 -- applyStemSelectionFilter (below) hides them by default since no
+  // job is loaded yet, and shows them in place of "vocals" once one is.
+  for (const name of ["original", ...STEM_NAMES, ...EXTRA_STEM_NAMES]) {
     const { row } = renderMixerRow({ name, url: "#" });
     mixerEl.appendChild(row);
   }
   requestAnimationFrame(() => _applyLaneHeight(1 + STEM_NAMES.length));
   applyStemSelectionFilter(new Set(STEM_NAMES));
-  titleEl.textContent = "Ready to import a track";
+  titleEl.textContent = t("player.readyToImport");
   bpmChip.textContent = "\u2014 BPM";
   keyChip.textContent = "\u2014 \u2014";
-  stemsChip.textContent = "\u2014 Stems";
+  stemsChip.textContent = t("footer.stemsPlaceholder");
   timeEl.textContent = "00:00 / 00:00";
   resetAnalysisCards();
   renderPlaceholderTracks();
   clearOverviewWaveforms();
   setLaneControlsEnabled(false);
 }
+
+// Same reasoning as the bootstrap ordering above: STEM_DISPLAY-derived text is
+// a one-time snapshot, not a live binding, so a language switch while no track
+// is loaded needs an explicit re-render. Guarded on "no-track" so this never
+// clobbers a real, already-loaded track's mixer with the empty shell.
+onLanguageChange(() => {
+  if (document.querySelector(".app")?.classList.contains("no-track")) renderEmptyShell();
+});
 
 function renderAllMiniWaves(mt, stems) {
   const wsArr = mt.wavesurfers || mt._wavesurfers;
@@ -838,7 +984,7 @@ export function setWaveformLoading(loading, phrase) {
     _loadingShownAt = performance.now();
     const phraseEl = document.getElementById("waveLoadingPhrase");
     if (phraseEl && phrase !== undefined) phraseEl.textContent = phrase;
-    else if (phraseEl && !phraseEl.textContent) phraseEl.textContent = "Still loading waveform…";
+    else if (phraseEl && !phraseEl.textContent) phraseEl.textContent = t("player.stillLoadingWaveform");
     el.classList.remove("hidden");
   } else {
     const elapsed = performance.now() - _loadingShownAt;
@@ -869,22 +1015,63 @@ export function buildStripStems() {
   }
 }
 
+// The lane count the panel is currently laid out for, and the observer that
+// re-fits it. _applyLaneHeight divides the wave panel's height between the
+// lanes, so it has to run again whenever that height changes -- which it now
+// does on demand, because collapsing a panel (#480) hands its height straight
+// to this one. Without this the lanes keep the size they were given at load and
+// the reclaimed space becomes a gap under them: 141px of it with all three
+// panels collapsed.
+let _laneCount = 0;
+let _laneFitObs = null;
+
+function _watchLaneFit(count) {
+  _laneCount = count;
+  _laneFitObs?.disconnect();
+  const panel = document.querySelector(".daw-wave-panel");
+  if (!panel) return;
+  // The panel is flex: 1 inside a fixed-height column, so its own height comes
+  // from its parent and never from the lanes. Writing lane heights from here
+  // cannot feed the observer its own output.
+  _laneFitObs = new ResizeObserver(() => {
+    // Only where the SVG overlay is the visible waveform. On the streaming path
+    // the lanes are WaveSurfer canvases sized when the tracks are created, and
+    // setOptions only re-renders the ones that have audio: a lane for a stem
+    // the user did not extract keeps its old height and the two columns drift
+    // apart. Measured on a six-lane job with two empty: 93, 93, 93, 70, 70, 93
+    // against mixer rows all at 95. Leaving that path at its load-time height
+    // costs it the reclaimed space and keeps it aligned, which is the better
+    // trade for an opt-out path.
+    if (!document.querySelector(".app")?.classList.contains("engine-waveforms")) return;
+    if (_laneCount > 0) _applyLaneHeight(_laneCount);
+  });
+  _laneFitObs.observe(panel);
+}
+
 function _applyLaneHeight(count) {
   const wavePanel = document.querySelector(".daw-wave-panel");
   const panelH = wavePanel?.clientHeight ?? 0;
-  const laneH = panelH > 0 && count > 0
-    ? Math.max(WAVEFORM_LANE_HEIGHT, Math.floor(panelH / count))
-    : WAVEFORM_LANE_HEIGHT;
+  // One row is a lane plus its separator, and BOTH columns have to agree on
+  // that number or they drift apart down the stack. They did: every mixer row
+  // draws its own 2px bottom border, so the mixer stack was count * (lane + 2),
+  // while the waveform column was told count * lane + (count - 1) * 2 -- one
+  // separator short. Two pixels over six lanes, which is why a stem name and
+  // its waveform ended up on different lines by the bottom of the mixer.
+  //
+  // So the row is the unit. Divide the panel by the row count, and give the
+  // mixer and the waveform column exactly the same total.
+  const rowH = panelH > 0 && count > 0
+    ? Math.max(WAVEFORM_LANE_HEIGHT + WAVEFORM_SEPARATOR_HEIGHT, Math.floor(panelH / count))
+    : WAVEFORM_LANE_HEIGHT + WAVEFORM_SEPARATOR_HEIGHT;
   const appEl = document.querySelector(".app");
-  appEl?.style.setProperty("--lane-h", `${laneH + 2}px`);
-  appEl?.style.setProperty(
-    "--wave-widget-track-stack-h",
-    `${count * laneH + (count - 1) * WAVEFORM_SEPARATOR_HEIGHT}px`,
-  );
-  return laneH;
+  appEl?.style.setProperty("--lane-h", `${rowH}px`);
+  appEl?.style.setProperty("--wave-widget-track-stack-h", `${count * rowH}px`);
+  // The drawable height inside a row, which is what the multitrack is given.
+  return rowH - WAVEFORM_SEPARATOR_HEIGHT;
 }
 
-export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, title = "", peaksPromise = null, hasVideo = false) {
+export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, title = "", peaksPromise = null, hasVideo = false, videoStatus = null) {
+  const rawStems = stems.filter((stem) => stem?.name && stem?.url);
   const app = document.querySelector(".app");
   app?.classList.remove("is-import");
   app?.classList.remove("no-track");
@@ -897,6 +1084,8 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
   }
   playBtn.classList.remove("playing");
   stopBtn.classList.remove("stopped");
+  resetPitch();
+  updatePitchAvailability(false);
   visualRenderToken += 1;
   const token = visualRenderToken;
   window.setTimeout(() => {
@@ -920,6 +1109,16 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
   setLoopEnd(0);
   loopBtn.classList.remove("active");
   loopRegionEl.classList.add("hidden");
+  // Loading a song is the end of whatever the structure toggle was asked to do
+  // for the last one. It costs minutes of CPU per import, so it goes back to
+  // off rather than quietly staying on for the next track.
+  autoSectionsResetFn?.();
+  // After the loop is cleared, never before: resetWaveZoom redraws the loop
+  // region, so running it first would paint the previous track's loop against
+  // this track's duration for a frame. A new track also starts fitted -- the
+  // previous track's zoom would open this one scrolled into the middle of a
+  // song the user has not seen yet.
+  resetWaveZoom();
   // Refresh loop UI so the exact-loop inputs enable + reset to 00:00.000 now
   // that the track duration is known.
   updateLoopRegionVisual();
@@ -933,12 +1132,31 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
   // the user selected all 6 stems, the backend doesn't produce
   // original.wav, so it's simply not in `stems` and the mixer/sidebar
   // rows for it stay hidden.)
-  stems = stems.filter((s) => s.name === "original" || selectedStems.has(s.name));
+  //
+  // vocals/lead_vocals/backing_vocals are mutually exclusive (#275): once a
+  // job's on-demand split has produced both, show those two in place of the
+  // plain Vocals lane rather than all three -- vocals.wav is never deleted by
+  // the split, so it would otherwise still show up here too.
+  const rawPresent = new Set(stems.map((s) => s.name));
+  const splitDone = rawPresent.has("lead_vocals") && rawPresent.has("backing_vocals");
+  const wantsVocals = selectedStems.has("vocals");
+  stems = stems.filter((s) => {
+    if (s.name === "original") return true;
+    if (s.name === "vocals") return wantsVocals && !splitDone;
+    if (s.name === "lead_vocals" || s.name === "backing_vocals") return wantsVocals && splitDone;
+    return selectedStems.has(s.name);
+  });
+  const playbackStems = buildPlaybackStems(rawStems, stems, STEM_NAMES);
+  const fullDecodeStems = addVisualOnlyStems(playbackStems, stems);
   _currentStems = stems;
   _mixUrl = mixUrl || null;
   _currentTitle = title || "";
   _currentHasVideo = !!hasVideo;
-  document.getElementById("footer-export-wrap")?.classList.toggle("has-video", !!hasVideo);
+  const exportWrap = document.getElementById("footer-export-wrap");
+  exportWrap?.classList.toggle("has-video", !!hasVideo);
+  // "failed" is the only status worth showing. "unavailable" means the source
+  // genuinely has no video stream, which is not a fault and not news (#436).
+  exportWrap?.classList.toggle("video-failed", videoStatus === "failed");
   applyStemSelectionFilter(new Set(stems.map((s) => s.name)));
   updateFooterTrack({ thumbnail, stemCount: stems.filter((s) => s.name !== "original").length });
 
@@ -959,12 +1177,26 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
     ? (() => {
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(), 3000);
-        return fetch(`/api/jobs/${jobId}/stems/peaks.json`, { signal: ac.signal })
+        return fetch(`/api/jobs/${jobId}/peaks`, { signal: ac.signal })
           .then((r) => (r.ok ? r.json() : {}))
           .catch(() => ({}))
           .finally(() => clearTimeout(timer));
       })()
     : Promise.resolve({}));
+
+  // Beat grid for the click track. Fetched alongside peaks; a 404 is the
+  // normal answer for jobs separated before the beat-grid stage existed, and
+  // simply leaves the click control disabled.
+  const _beatsPromise = jobId
+    ? (() => {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 5000);
+        return fetch(`/api/jobs/${jobId}/beats`, { signal: ac.signal })
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => null)
+          .finally(() => clearTimeout(timer));
+      })()
+    : Promise.resolve(null);
 
   for (const stem of stems) {
     const row = mixerEl.querySelector(`.lane-header[data-stem="${stem.name}"]`);
@@ -972,11 +1204,11 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
     const dl = row.querySelector(".lane-dl");
     if (dl) {
       dl.href = stem.url;
-      dl.download = `${stem.name}.wav`;
+      dl.download = _stemFilename(stem.name);
     }
   }
 
-  stemsChip.textContent = `${stems.length} Stems`;
+  stemsChip.textContent = plural("footer.stemsCount", stems.length);
 
   if (thumbnail) {
     npThumb.onload = () => npThumb.classList.add("loaded");
@@ -988,9 +1220,12 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
 
   // "original" is prepended at row 0 only when it actually has a URL so it
   // appears at the top. Omitting it when absent avoids a phantom 70px gap.
-  // STEM_NAMES follow at the next consecutive rows so mixer lanes stay aligned.
+  // The (already-filtered) stem order follows at the next consecutive rows so
+  // mixer lanes stay aligned -- lead_vocals/backing_vocals in place of vocals
+  // when this job's on-demand split (#275) produced them.
   const stemsByName = Object.fromEntries(stems.map((s) => [s.name, s]));
-  const orderedNames = [...(stemsByName["original"] ? ["original"] : []), ...STEM_NAMES];
+  const order = effectiveStemOrder(new Set(stems.map((s) => s.name)));
+  const orderedNames = [...(stemsByName["original"] ? ["original"] : []), ...order];
   setTrackIndex(Object.fromEntries(orderedNames.map((name, i) => [name, i])));
   multitrackContainer.innerHTML = "";
 
@@ -999,7 +1234,7 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
   // WAVs — otherwise its 6 blob fetches compete with the engine's 6 decodes for
   // the 6-connection HTTP/1.1 limit and `canplay` stalls (the WebView2/WKWebView
   // freeze). Null URLs make the multitrack's <audio> elements ready instantly.
-  const engineStemCount = stems.filter((s) => s.url).length;
+  const engineStemCount = fullDecodeStems.filter((s) => s.url).length;
   const mode = engineMode();
   // Only the full-decode engine holds all PCM in RAM, so only it is size-capped;
   // the chunked engine streams and is never "too large".
@@ -1019,6 +1254,7 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
   }
 
   const laneH = _applyLaneHeight(orderedNames.length);
+  _watchLaneFit(orderedNames.length);
 
   const mt = Multitrack.create(
     orderedNames.map((name, i) => ({
@@ -1099,9 +1335,18 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
       `[player] canplay — ${stems.length} stems, ctx=${ctx?.state}, audios:`,
       mt.audios?.map((a, i) => `${orderedNames[i]}:${a?.constructor?.name}`),
     );
-    // Log load errors only for stems that actually have a source URL
+    // Log load errors only for stems that actually have a source URL.
+    //
+    // `useEngine` has to be part of that test, not just the stem descriptor.
+    // When the engine owns playback every multitrack stem is handed url: null
+    // above, so all of these elements have an empty src by design, while
+    // stemsByName still holds the real URL the engine is streaming from. Testing
+    // only the descriptor therefore passed, attached an error listener to an
+    // element that was never given a source, and logged six MEDIA_ELEMENT_ERROR
+    // "Empty src attribute" lines on every engine-backed track load. Harmless to
+    // playback, and noisy enough to bury a real error in a bug report.
     mt.audios?.forEach((a, i) => {
-      if (a instanceof HTMLMediaElement && stemsByName[orderedNames[i]]?.url) {
+      if (!useEngine && a instanceof HTMLMediaElement && stemsByName[orderedNames[i]]?.url) {
         a.addEventListener("error", () =>
           console.error(`[player] audio error stem[${i}] ${orderedNames[i]}:`, a.error?.message, a.error?.code),
         { once: true });
@@ -1111,6 +1356,7 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
     timeEl.textContent = `00:00 / ${fmtTime(totalDuration)}`;
     buildRuler(totalDuration);
     buildPresenceRuler(totalDuration);
+    buildFooterWaveTicks(totalDuration);
     updateFooterTimes(0);
     updatePresencePlayhead(0);
     setMasterVolume(masterFader ? parseFloat(masterFader.value) : masterVolume);
@@ -1206,6 +1452,7 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
         updatePresencePlayhead(t);
         updateStopVisual();
       };
+      teardownMetronome();
       if (audioEngine) { audioEngine.destroy(); setAudioEngine(null); }
       const onEnded = () => { playBtn.classList.remove("playing"); updateStopVisual(); };
       // Engine bring-up, callable twice: the chunked path falls back to
@@ -1213,26 +1460,102 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
       // backend's documented degradation for missing peaks is client-side
       // decode — which only the full-decode engine can provide.
       const startEngine = (kind) => {
+        updatePitchAvailability(false);
+        setLaneKeysAvailable(false);
+        // Retract a previous track's playback failure. Without this the box
+        // stays up over a track that plays fine, since nothing else clears it.
+        clearPlaybackError();
         const eng = kind === "chunked"
-          ? createChunkedAudioEngine(stems, { onTime: driveTransportUi, onEnded })
-          : createAudioEngine(stems, { onTime: driveTransportUi, onEnded });
+          ? createChunkedAudioEngine(playbackStems, { onTime: driveTransportUi, onEnded })
+          : createAudioEngine(fullDecodeStems, { onTime: driveTransportUi, onEnded });
         setAudioEngine(eng);
         eng.ready.then((ok) => {
           // Bail if the user switched tracks while we were initialising.
           if (token !== visualRenderToken || multitrack !== mt) {
+            teardownMetronome();
             eng.destroy();
             if (audioEngine === eng) setAudioEngine(null);
             return;
           }
           if (!ok) {
             // No usable stems — drop the engine (null-URL multitrack stays mounted).
-            console.warn("[player] audio engine had no usable stems; playback disabled");
+            const reason = eng.getLoadError?.();
+            teardownMetronome();
             eng.destroy();
-            setAudioEngine(null);
+            if (audioEngine === eng) setAudioEngine(null);
+
+            // The chunked engine parses WAV containers itself, so a layout it
+            // cannot read disables playback on a file the browser's own decoder
+            // would have handled (#343). Try that decoder before giving up,
+            // under the same RAM ceiling the missing-peaks swap below uses.
+            if (kind === "chunked"
+                && estimateDecodedBytes(totalDuration, engineStemCount) <= MAX_ENGINE_DECODED_BYTES) {
+              console.warn("[player] chunked engine could not read these stems; trying full decode:", reason);
+              startEngine("fulldecode");
+              return;
+            }
+
+            console.warn("[player] audio engine had no usable stems; playback disabled:", reason);
+            updateMetronomeAvailability(null, t("click.reason.playbackUnavailable"));
+            showPlaybackError(
+              reason || t("player.audioCouldNotLoad"),
+              t("player.playbackDisabledFull"),
+              { jobId, engine: kind, stage: "Loading stems" },
+            );
             return;
           }
+          // Playback actually came up for this track — clear a stale
+          // "playback failed" notification if one was sitting there (#401).
+          resolvePlaybackSuccess(jobId);
           eng.setLoop(loopEnabled, loopStart, loopEnd);
+          updatePitchAvailability(eng.supportsPitchShift?.() === true);
           applyMix(); // push per-stem gains (incl. >1.0 boost) into the engine
+          // Lane keys ride on the same engine, so they are restored from the
+          // per-track store in the same breath as the gains.
+          setLaneKeysAvailable(eng.supportsPitchShift?.() === true);
+          applyAllLanePitches();
+
+          // Click track. Bound to this engine instance, so it is rebuilt on
+          // every engine bring-up (including the chunked -> fulldecode swap
+          // below) and torn down with it.
+          _beatsPromise.then((grid) => {
+            if (token !== visualRenderToken || multitrack !== mt || audioEngine !== eng) return;
+            teardownMetronome();
+            const beats = Array.isArray(grid?.beats) ? grid.beats : null;
+            if (!beats?.length) {
+              updateMetronomeAvailability(null, t("click.reason.noBeatGrid"));
+              setExportClickAvailable(false);
+              return;
+            }
+            const m = createMetronome(eng, beats, {
+              volume: metronomeVolume,
+              beatsPerBar: metronomeBeatsPerBar,
+            });
+            setMetronome(m);
+            updateMetronomeAvailability(m ? grid : null,
+              m ? "" : t("click.reason.unavailableOnPath"));
+            if (m && metronomeEnabled) m.setEnabled(true);
+
+            // Grid editor over the same data. Every edit pushes straight into
+            // the running click, so a dragged beat is audible on the next beat
+            // rather than after a reload.
+            const editable = initBeatGrid({
+              jobId,
+              grid,
+              duration: totalDuration,
+              onChange: (nextBeats, nextBars) => {
+                m?.setBeats?.(nextBeats);
+                setMetronomeHasBars(Array.isArray(nextBars) && nextBars.length > 0);
+                applyMetronomeAccent();
+                syncBeatGridButtons();
+              },
+            });
+            setBeatGridAvailable(!!editable && !!m);
+            setExportClickAvailable(!!beats?.length);
+            // One place decides how accents are driven; the panel's Accent
+            // setting can override the detected bar marks.
+            applyMetronomeAccent();
+          });
           if (kind === "chunked") {
             // Streaming path: the engine holds no full buffers. Overview waveforms
             // come from peaks.json (rendered by the _peaksPromise handler above);
@@ -1248,6 +1571,7 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
                 // audio and accept placeholder waveforms).
                 if (estimateDecodedBytes(totalDuration, engineStemCount) <= MAX_ENGINE_DECODED_BYTES) {
                   console.warn("[player] no peaks.json; using full-decode engine for visuals");
+                  teardownMetronome();
                   eng.destroy();
                   if (audioEngine === eng) setAudioEngine(null);
                   startEngine("fulldecode");
@@ -1284,13 +1608,29 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
           }
         }).catch((e) => {
           console.warn("[player] audio engine init failed; playback disabled:", e);
+          teardownMetronome();
+          updateMetronomeAvailability(null, t("click.reason.playbackUnavailable"));
           eng.destroy();
           if (audioEngine === eng) setAudioEngine(null);
+          showPlaybackError(
+            t("player.audioCouldNotLoad"),
+            String(e?.message || e) || t("player.playbackDisabled"),
+            { jobId, engine: kind, stage: "Starting the audio engine" },
+          );
         });
       };
       // Default: chunked streaming engine (fast start, low RAM). "fulldecode"
       // opts into the legacy decode-everything engine.
       startEngine(mode === "chunked" ? "chunked" : "fulldecode");
+    } else {
+      // Legacy streaming path: playback runs on <audio> elements with no
+      // shared AudioContext, so there is no clock a click could lock to.
+      // Offering an approximate one would drift against the music, which is
+      // worse than not offering it.
+      teardownMetronome();
+      updateMetronomeAvailability(null, t("click.reason.needsWebAudio"));
+      updatePitchAvailability(false);
+      setLaneKeysAvailable(false);
     }
   });
 }
@@ -1388,7 +1728,10 @@ async function initFooterWaveform(stemUrl) {
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   if (!AudioCtx) return;
   try {
-    visualAudioContext ??= new AudioCtx();
+    // Decode-only, for the footer's peaks. It never plays anything, so a
+    // 192 kHz device would cost it four times the buffer for four times the
+    // samples per peak bar and not one pixel of extra detail (#578).
+    visualAudioContext ??= createPlaybackContext(AudioCtx);
     const res = await fetch(stemUrl, { cache: "force-cache" });
     if (!res.ok) return;
     const buf = await visualAudioContext.decodeAudioData(await res.arrayBuffer());
@@ -1434,18 +1777,47 @@ export function updateFooterTrack({ title, thumbnail, key, bpm, stemCount } = {}
   }
 }
 
-function _triggerDownload(url, filename) {
-  const fullUrl = url.startsWith("http") ? url : `${location.origin}${url}`;
-  if (window.__TAURI__?.core?.invoke) {
-    window.__TAURI__.core.invoke("save_audio_file", { url: fullUrl, filename });
-    return;
+// Returns a promise that settles when the file is actually on disk, or `true`
+// when the host gives no completion signal. Callers use the difference to show
+// a real "Exporting…" state instead of a fixed-length guess.
+//
+// `onTransferStart` fires when bytes actually begin moving, which on desktop is
+// after the user has chosen a destination. Awaiting one combined command made
+// the button read "Exporting…" for however long the save dialog sat open, when
+// nothing was being exported yet (#338). Callers enter their busy state here
+// rather than on click.
+// The Rust side only accepts an absolute localhost URL: a bare path would be
+// resolved against nothing there, so validate_download_url rejects it. Lane
+// links get this for free because href is a DOM property; anything built as a
+// string has to be absolutised here.
+function _absolute(url) {
+  return url.startsWith("http") ? url : `${location.origin}${url}`;
+}
+
+function _triggerDownload(url, filename, onTransferStart) {
+  const fullUrl = _absolute(url);
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (invoke) {
+    // Two commands: the dialog, then the transfer. A cancelled dialog resolves
+    // to null and never starts a transfer, so no busy state is entered and
+    // there is none to unwind.
+    return invoke("pick_export_destination", { filename }).then((token) => {
+      if (!token) return false;
+      onTransferStart?.();
+      return invoke("download_to_path", { token, url: fullUrl });
+    });
   }
+  // A browser <a download> is fire-and-forget: the fetch is owned by the
+  // download manager and reports nothing back to the page. There is no dialog
+  // to wait on, so the transfer is under way as soon as the click lands.
+  onTransferStart?.();
   const a = document.createElement("a");
   a.href = fullUrl;
   a.download = filename;
   document.body.appendChild(a);
   a.click();
   a.remove();
+  return true;
 }
 
 // Per-lane effective gain mirroring mixer.js applyMix (volume + mute + solo),
@@ -1457,6 +1829,7 @@ function _effectiveMixGains() {
   const anySolo = _currentStems.some((s) => mixerState[s.name]?.soloed);
   const names = [];
   const gains = [];
+  const pitches = [];
   for (const s of _currentStems) {
     if (s.name === "mix") continue;
     const m = mixerState[s.name];
@@ -1465,25 +1838,90 @@ function _effectiveMixGains() {
     if (g <= 0) continue;
     names.push(s.name);
     gains.push(Math.max(0, Math.min(LANE_VOLUME_MAX, g)));
+    // The lane's own key, the same number the stepper shows. The server
+    // re-applies effectivePitch, so drums are refused there too rather than
+    // this being the only thing standing between a snare and a resampler.
+    pitches.push(effectivePitch(s.name, m.pitch ?? 0, undefined));
   }
-  return { names, gains };
+  return { names, gains, pitches };
+}
+
+// Click-track export params. The click is synthesised in the browser during
+// playback, so the server can only reproduce it if it is told the rate and
+// accent mode the user was monitoring with. Opt-in: baking a permanent click
+// into an export meant to be clean is not obvious until playback.
+function _clickParams(q) {
+  if (!exportClickEl?.checked || exportClickEl.disabled) return;
+  q.set("click", "1");
+  q.set("click_mult", String(metronome?.getMultiplier?.() ?? 1));
+  q.set("click_accent", String(metronomeBeatsPerBar));
+  q.set("click_gain", metronomeVolume.toFixed(3));
+  if (metronomeGrouping) q.set("click_groups", metronomeGrouping.join("+"));
+}
+
+// Count-in export param (issue #269). Independent of the running click track:
+// a clean backing track can still be counted in. Bars of the detected meter,
+// prepended ahead of the audio by the backend. Audio exports only -- the MP4
+// video path leaves it off, since prepending it would desync the picture.
+//
+// Length follows the transport's count-in setting (#587), so an export counts
+// the user in for as long as playback does. When the transport count-in is off
+// but the export box is ticked, one bar -- the behaviour before the setting
+// existed, and the only sensible reading of "count me in" with no length given.
+function _countInParam(q) {
+  if (!exportCountInEl?.checked || exportCountInEl.disabled) return;
+  q.set("count_in", String(metronomeCountInBars > 0 ? metronomeCountInBars : 1));
+  // The count-in's tempo/meter follow the same rate and accent the click uses,
+  // so pass them even when the click itself is not being baked in.
+  q.set("click_mult", String(metronome?.getMultiplier?.() ?? 1));
+  q.set("click_accent", String(metronomeBeatsPerBar));
+  q.set("click_gain", metronomeVolume.toFixed(3));
+  if (metronomeGrouping) q.set("click_groups", metronomeGrouping.join("+"));
+}
+
+/** Whether this track can export a click / count-in at all (needs a beat grid). */
+export function setExportClickAvailable(on) {
+  for (const [el, wrap] of [
+    [exportClickEl, exportClickWrap],
+    [exportCountInEl, exportCountInWrap],
+  ]) {
+    if (!el) continue;
+    el.disabled = !on;
+    if (!on) el.checked = false;
+    wrap?.classList.toggle("disabled", !on);
+  }
 }
 
 // Dynamic mixdown URL for the current mixer state. Returns null (no download)
 // when every lane is silenced; `region` appends the loop bounds.
 function _mixdownUrl(ext, region) {
   if (!currentJobId) return null;
-  const { names, gains } = _effectiveMixGains();
+  const { names, gains, pitches } = _effectiveMixGains();
   if (!names.length) return null;
   const q = new URLSearchParams({
     stems: names.join(","),
     gains: gains.map((g) => g.toFixed(3)).join(","),
+    ...(pitches.some((p) => p !== 0) ? { pitches: pitches.join(",") } : {}),
   });
   if (region) {
     q.set("start", loopStart.toFixed(3));
     q.set("end", loopEnd.toFixed(3));
   }
+  _clickParams(q);
+  _countInParam(q);
   return `/api/jobs/${currentJobId}/mixdown.${ext}?${q}`;
+}
+
+// One stem, named after the song so it stays identifiable once dragged into a
+// project folder next to other songs' stems (#336). Falls back to the bare stem
+// name when the song has no usable title.
+function _stemFilename(name, ext = "wav") {
+  const safe = _currentTitle
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/_{2,}/g, "_")
+    .slice(0, 80)
+    .replace(/^_+|_+$/g, "");
+  return safe ? `${safe}_${name}.${ext}` : `${name}.${ext}`;
 }
 
 function _exportFilename(ext) {
@@ -1498,60 +1936,43 @@ function _exportFilename(ext) {
 // The download functions return true when a download was triggered and false
 // when there is nothing audible to export (every lane muted), so the caller can
 // surface a message.
-export function downloadCurrentMix(ext = "wav") {
+export function downloadCurrentMix(ext = "wav", onTransferStart) {
   const url = _mixdownUrl(ext, false);
   if (!url) return false;
-  _triggerDownload(url, _exportFilename(ext));
-  return true;
+  return _triggerDownload(url, _exportFilename(ext), onTransferStart);
 }
 
 // MP4 export: the preserved source video muxed with the current audio mix.
 // Only meaningful for mp4-sourced jobs (currentJobHasVideo()); returns false when
 // there's no video track or every lane is muted.
-export function downloadCurrentVideo() {
+export function downloadCurrentVideo(onTransferStart) {
   if (!currentJobId || !_currentHasVideo) return false;
-  const { names, gains } = _effectiveMixGains();
+  const { names, gains, pitches } = _effectiveMixGains();
   if (!names.length) return false;
   const q = new URLSearchParams({
     stems: names.join(","),
     gains: gains.map((g) => g.toFixed(3)).join(","),
+    ...(pitches.some((p) => p !== 0) ? { pitches: pitches.join(",") } : {}),
   });
+  _clickParams(q);
   const safe = _currentTitle
     .replace(/[^a-zA-Z0-9]+/g, "_")
     .replace(/_{2,}/g, "_")
     .slice(0, 80)
     .replace(/^_+|_+$/g, "");
   const name = safe ? `${safe}_video.mp4` : "video.mp4";
-  _triggerDownload(`/api/jobs/${currentJobId}/video.mp4?${q}`, name);
-  return true;
+  return _triggerDownload(`/api/jobs/${currentJobId}/video.mp4?${q}`, name, onTransferStart);
 }
 
-export function downloadCurrentStems(format = "wav", onProgress) {
-  const stems = _currentStems.filter((s) => s.name !== "original");
-  const total = stems.length;
-  if (!total) { onProgress?.(0, 0); return; }
-  // Name each file "<song title>_<instrument>.<ext>" using the same title
-  // sanitization as the mix/region exports.
-  const safe = _currentTitle
-    .replace(/[^a-zA-Z0-9]+/g, "_")
-    .replace(/_{2,}/g, "_")
-    .slice(0, 80)
-    .replace(/^_+|_+$/g, "");
-  stems.forEach((s, i) => {
-    window.setTimeout(() => {
-      const url = format === "mp3" ? s.url.replace(/\.wav(\?|$)/, ".mp3$1") : s.url;
-      const fname = safe ? `${safe}_${s.name}.${format}` : `${s.name}.${format}`;
-      _triggerDownload(url, fname);
-      onProgress?.(i + 1, total);
-    }, i * 150);
-  });
-}
 
-export function downloadAllStemsZip(format = "wav") {
-  if (!currentJobId) return;
+// Returns false when there is nothing to zip, matching downloadCurrentMix and
+// downloadCurrentVideo, so the caller can skip the "Exporting…" state instead of
+// showing it for a download that never starts.
+export function downloadAllStemsZip(format = "wav", onTransferStart) {
+  if (!currentJobId) return false;
   // Only the active (selected) stems loaded in the DAW — not all 6.
   const names = _currentStems.filter((s) => s.name !== "original").map((s) => s.name);
-  if (!names.length) return;
+  if (!names.length) return false;
   const safe = _currentTitle
     .replace(/[^a-zA-Z0-9]+/g, "_")
     .replace(/_{2,}/g, "_")
@@ -1559,7 +1980,7 @@ export function downloadAllStemsZip(format = "wav") {
     .replace(/^_+|_+$/g, "");
   const name = safe ? `${safe}_stems.zip` : "stems.zip";
   const q = new URLSearchParams({ format, stems: names.join(",") });
-  _triggerDownload(`/api/jobs/${currentJobId}/stems/all.zip?${q}`, name);
+  return _triggerDownload(`/api/jobs/${currentJobId}/stems/all.zip?${q}`, name, onTransferStart);
 }
 
 function _regionFilename(ext) {
@@ -1571,10 +1992,81 @@ function _regionFilename(ext) {
   return `${safe || "region"}_region.${ext}`;
 }
 
-export function downloadRegionMix(ext = "wav") {
+// The region a drag hands over, or null when there is nothing to drag.
+//
+// Named with the region bounds, unlike the Export Region filename: a dragged
+// file lands in a folder nothing ever cleans up, and the Rust side reuses a
+// file that is already there. Two different loops of one song sharing a name
+// would mean the second drag silently handed over the first one's audio.
+function _regionDragFilename(ext) {
+  const safe = _currentTitle
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/_{2,}/g, "_")
+    .slice(0, 80)
+    .replace(/^_+|_+$/g, "");
+  return `${safe || "region"}_region_${_loopSpan()}.${ext}`;
+}
+
+// The bounds, as a filename fragment. Both region drags carry it, because the
+// exports folder is never cleaned up and the Rust side reuses a file already
+// sitting there.
+function _loopSpan() {
+  return `${loopStart.toFixed(1)}-${loopEnd.toFixed(1)}`.replace(/\./g, "_");
+}
+
+// One lane's slice of the loop.
+//
+// At unity gain, and regardless of mute or solo: this is the stem, the way the
+// lane's own download button gives you the stem, just trimmed to the loop. The
+// mix, with the balance you set, is what the grip above the lanes carries. No
+// click track or count-in either, for the same reason -- those belong to a
+// mixdown, not to a single stem.
+export function stemRegionDragPayload(name, ext = "wav") {
+  if (!currentJobId || !loopEnabled || loopStart >= loopEnd) return null;
+  const q = new URLSearchParams({
+    stems: name,
+    gains: "1.000",
+    start: loopStart.toFixed(3),
+    end: loopEnd.toFixed(3),
+  });
+  const safe = _currentTitle
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/_{2,}/g, "_")
+    .slice(0, 80)
+    .replace(/^_+|_+$/g, "");
+  const stem = safe ? `${safe}_${name}` : name;
+  return {
+    url: _absolute(`/api/jobs/${currentJobId}/mixdown.${ext}?${q}`),
+    filename: `${stem}_region_${_loopSpan()}.${ext}`,
+  };
+}
+
+export function regionDragPayload(ext = "wav") {
+  if (!loopEnabled || loopStart >= loopEnd) return null;
+  const url = _mixdownUrl(ext, true);
+  if (!url) return null;
+  return { url: _absolute(url), filename: _regionDragFilename(ext) };
+}
+
+// Render the region before the user reaches for it.
+//
+// A drag has to be handed to the OS while the mouse button is still down, so
+// the file cannot be rendered during the gesture: ffmpeg takes long enough
+// that the button would be released first and the drag would never attach.
+// Warming the server's render cache (_mixdown_cache_key in app/api/stems.py)
+// is what makes the drag itself a file copy.
+//
+// Range: bytes=0-0 so this costs a render, which is the point, and not the
+// transfer, which would be the whole region twice.
+export function prewarmRegionMix(ext = "wav") {
+  const payload = regionDragPayload(ext);
+  if (!payload) return;
+  fetch(payload.url, { headers: { Range: "bytes=0-0" } }).catch(() => {});
+}
+
+export function downloadRegionMix(ext = "wav", onTransferStart) {
   if (!loopEnabled || loopStart >= loopEnd) return false;
   const url = _mixdownUrl(ext, true);
   if (!url) return false;
-  _triggerDownload(url, _regionFilename(ext));
-  return true;
+  return _triggerDownload(url, _regionFilename(ext), onTransferStart);
 }

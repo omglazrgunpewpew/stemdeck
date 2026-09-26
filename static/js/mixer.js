@@ -1,18 +1,36 @@
 import {
-  STEM_NAMES, TRACK_NAMES, STEM_COLORS, STEM_DISPLAY, LANE_VOLUME_MAX,
+  STEM_NAMES, TRACK_NAMES, EXTRA_STEM_NAMES, STEM_COLORS, STEM_DISPLAY, LANE_VOLUME_MAX,
 } from "./constants.js";
+
+// Every lane name this session might ever need mixer state for, including
+// the on-demand lead/backing vocal split (#275). Safe to iterate broadly:
+// callers below all guard on the row/trackIndex entry actually existing, so
+// touching state for a lane a given job doesn't have is a no-op. A function
+// (not a snapshot) because STEM_NAMES/EXTRA_STEM_NAMES are reassigned once
+// syncStemNamesFromAPI() resolves -- a const array here would freeze the
+// fallback values from before that happens.
+function allTrackNames() {
+  return [...TRACK_NAMES, ...EXTRA_STEM_NAMES];
+}
 import {
   mixerState, mixerEl, stemListEl, currentJobId, multitrack, trackIndex,
   masterVolume, audioEngine,
 } from "./state.js";
 import { storeGet, storeSetDebounced } from "./utils.js";
+import { t } from "./i18n.js";
+import { PITCH_MAX, PITCH_MIN, clampPitch, pitchBlockedKey } from "./pitchBus.js";
 
 function defaultMixerEntry() {
-  return { volume: 1, muted: false, soloed: false };
+  // `pitch` is the key this lane is actually in, in semitones from the
+  // recording's own key. Absolute rather than an offset from the global
+  // control, so the number on a lane never has to be added to another number to
+  // know what you are hearing. It rides along in the same per-track store as
+  // volume and mute, so a lane's key survives a reload.
+  return { volume: 1, muted: false, soloed: false, pitch: 0 };
 }
 
 export function ensureMixerStateDefaults() {
-  for (const name of TRACK_NAMES) {
+  for (const name of allTrackNames()) {
     if (!mixerState[name]) mixerState[name] = defaultMixerEntry();
   }
 }
@@ -23,7 +41,7 @@ export async function loadMixIntoState(jobId, loadedStemNames = STEM_NAMES) {
     const data = await storeGet(`stemdeck:mix:${jobId}`, {});
     if (data && typeof data === "object") stored = data;
   } catch (e) { console.warn("[mixer] failed to load mix state:", e); }
-  for (const name of TRACK_NAMES) {
+  for (const name of allTrackNames()) {
     Object.assign(mixerState[name], defaultMixerEntry(), stored[name] || {});
   }
   // If all loaded stems are muted the session is unplayable -- unmute as recovery.
@@ -34,7 +52,7 @@ export async function loadMixIntoState(jobId, loadedStemNames = STEM_NAMES) {
 }
 
 export function resetMixerState() {
-  for (const name of TRACK_NAMES) {
+  for (const name of allTrackNames()) {
     Object.assign(mixerState[name], defaultMixerEntry());
   }
 }
@@ -44,10 +62,109 @@ function saveMix() {
   storeSetDebounced(`stemdeck:mix:${currentJobId}`, mixerState);
 }
 
+/** Push one lane's transpose into whichever engine is playing. */
+export function applyLanePitch(name) {
+  if (!audioEngine?.setStemPitch) return;
+  audioEngine.setStemPitch(name, mixerState[name]?.pitch ?? 0);
+}
+
+/** Re-send every lane transpose. Called once an engine finishes starting. */
+export function applyAllLanePitches() {
+  for (const name of allTrackNames()) {
+    if (mixerState[name]) applyLanePitch(name);
+    refreshLaneKeyVisual(name);
+  }
+}
+
+/**
+ * Move every lane by `delta` semitones.
+ *
+ * This is what the transport bar's global control does. It nudges rather than
+ * overrides, so a lane deliberately put in a different key keeps its distance
+ * from the rest instead of being flattened back in with them.
+ */
+export function nudgeAllLanePitches(delta) {
+  if (!delta) return;
+  for (const name of allTrackNames()) {
+    const state = mixerState[name];
+    if (!state || name === "drums") continue;
+    setLanePitch(name, state.pitch + delta);
+  }
+}
+
+/** Put every lane back in the recording's own key. */
+export function resetAllLanePitches() {
+  for (const name of allTrackNames()) {
+    if (mixerState[name]) setLanePitch(name, 0);
+  }
+}
+
+/**
+ * Transpose one lane.
+ *
+ * Drums are refused here as well as in the engine and the worklet. Three
+ * refusals sounds excessive for one rule, but each covers a different way in:
+ * this one is the UI, the engine covers a caller reaching past it, and the
+ * worklet covers a bus being wired wrong.
+ */
+export function setLanePitch(name, semitones) {
+  const state = mixerState[name];
+  if (!state || name === "drums") return;
+  const next = clampPitch(semitones);
+  if (state.pitch === next) return;
+  state.pitch = next;
+  saveMix();
+  applyLanePitch(name);
+  refreshLaneKeyVisual(name);
+}
+
+/** Redraw one lane's key stepper from state. */
+export function refreshLaneKeyVisual(name) {
+  const wrap = mixerEl?.querySelector(`.lane-key[data-stem="${name}"]`);
+  if (!wrap) return;
+  const n = mixerState[name]?.pitch ?? 0;
+  const signed = n > 0 ? `+${n}` : String(n);
+  const valueEl = wrap.querySelector(".lane-key-value");
+  // "K" while the lane is in its own key, so the control reads as a label
+  // until it is doing something, and as a number the moment it is.
+  if (valueEl) valueEl.textContent = n === 0 ? "K" : signed;
+  wrap.classList.toggle("active", n !== 0);
+
+  const locked = wrap.classList.contains("locked");
+  const unsupported = wrap.classList.contains("unsupported");
+  const up = wrap.querySelector(".lane-key-step.up");
+  const down = wrap.querySelector(".lane-key-step.down");
+  if (up) up.disabled = locked || unsupported || n >= PITCH_MAX;
+  if (down) down.disabled = locked || unsupported || n <= PITCH_MIN;
+  // One place decides the tooltip. Setting it from both here and from
+  // availability left a drum lane explaining the wrong thing after the engine
+  // came up, because whichever ran last won and neither restored the other.
+  if (locked) wrap.title = t("mixer.key.drumsLocked");
+  // Same reason as the transport control, so the same sentence: a lane saying
+  // "needs Web Audio" while the group above it names the real cause would just
+  // be two answers to one question (#552).
+  else if (unsupported) wrap.title = t(pitchBlockedKey());
+  else wrap.title = t("mixer.key.title", { n: signed });
+}
+
+/**
+ * Mark every lane's key stepper usable or not.
+ *
+ * Without AudioWorklet there is no pitch stage at all, and a stepper that
+ * changes its own label while the sound never moves is worse than one that
+ * plainly says it cannot.
+ */
+export function setLaneKeysAvailable(available) {
+  for (const wrap of mixerEl?.querySelectorAll(".lane-key") || []) {
+    wrap.classList.toggle("unsupported", !available);
+    refreshLaneKeyVisual(wrap.dataset.stem);
+  }
+}
+
 export function applyMix() {
   if (!multitrack) return;
-  const anySolo = TRACK_NAMES.some((name) => trackIndex[name] !== undefined && mixerState[name]?.soloed);
-  for (const name of TRACK_NAMES) {
+  const anySolo = allTrackNames().some((name) => trackIndex[name] !== undefined && mixerState[name]?.soloed);
+  for (const name of allTrackNames()) {
     const s = mixerState[name];
     if (!s) continue;
     let effective = s.volume;
@@ -108,7 +225,7 @@ export function setLaneVolume(name, v) {
 }
 
 export function refreshMixerVisuals() {
-  for (const name of TRACK_NAMES) {
+  for (const name of allTrackNames()) {
     const state = mixerState[name];
     if (!state) continue;
     // Mixer-column lane header
@@ -143,7 +260,7 @@ export function refreshMixerVisuals() {
         }
         if (mon) {
           // Active when this stem is THE lone solo (the "monitor" target).
-          const others = TRACK_NAMES.filter((n) => n !== name);
+          const others = allTrackNames().filter((n) => n !== name);
           const lone = state.soloed
             && others.every((n) => !mixerState[n]?.soloed);
           mon.classList.toggle("active", lone);
@@ -306,7 +423,7 @@ function makeVolumeKnob(stemName, color) {
   input.setAttribute("value", "1");
   input.style.setProperty("--fader-color", color);
   input.style.setProperty("--lane-pos", "0.5");
-  input.setAttribute("aria-label", `${STEM_DISPLAY[stemName] || stemName} volume`);
+  input.setAttribute("aria-label", t("aria.volume", { name: STEM_DISPLAY[stemName] || stemName }));
   input.addEventListener("input", () => setLaneVolume(stemName, parseFloat(input.value)));
   input.addEventListener("dblclick", (e) => { e.stopPropagation(); setLaneVolume(stemName, 1); });
   wrap.appendChild(input);
@@ -333,6 +450,61 @@ function stemIconMarkup(stemName) {
     original: `<svg ${common}><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>`,
   };
   return icons[stemName] || icons.other;
+}
+
+// ─── Drag preview ───
+//
+// What follows the cursor when a lane is dragged out to the OS.
+//
+// The lane's instrument glyph was the obvious choice and was wrong: these are
+// 24px line icons, and at the size a drag image is drawn they stop reading as
+// instruments -- the bass turns into a key, the kit into a face. A word cannot
+// be misread. It is also the same word the lane is labelled with, so nothing
+// has to be recognised at all.
+//
+// Built on demand rather than cached: it is a few canvas calls with no image
+// decode, so there is nothing to save, and a cache would go stale the moment
+// the language changed.
+
+const PREVIEW_H = 64;
+const PREVIEW_FONT = '700 30px system-ui, -apple-system, "Segoe UI", sans-serif';
+
+export function laneDragIcon(stemName) {
+  try {
+    const label = t(`stem.${stemName}`) || stemName;
+    const canvas = document.createElement("canvas");
+    let ctx = canvas.getContext("2d");
+    ctx.font = PREVIEW_FONT;
+    // Sizing the canvas resets every context property, so the font is set
+    // once to measure and again to draw.
+    canvas.width = Math.ceil(ctx.measureText(label).width) + 52;
+    canvas.height = PREVIEW_H;
+    ctx = canvas.getContext("2d");
+    ctx.font = PREVIEW_FONT;
+
+    // An opaque plate: a drag image that is transparent except for the letters
+    // is close to unreadable over a DAW timeline.
+    ctx.fillStyle = "rgba(10, 16, 22, 0.94)";
+    if (ctx.roundRect) {
+      ctx.beginPath();
+      ctx.roundRect(0, 0, canvas.width, PREVIEW_H, 14);
+      ctx.fill();
+    } else {
+      ctx.fillRect(0, 0, canvas.width, PREVIEW_H);
+    }
+
+    ctx.fillStyle = STEM_COLORS[stemName] || "#d8a84a";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(label, canvas.width / 2, PREVIEW_H / 2 + 1);
+
+    return canvas.toDataURL("image/png").split(",")[1];
+  } catch (e) {
+    // Rust falls back to the app icon, which is a worse picture and a working
+    // drag.
+    console.warn("[stemdeck] could not build a drag preview for", stemName, e);
+    return null;
+  }
 }
 
 export function renderMixerRow(stem) {
@@ -377,12 +549,19 @@ export function renderMixerRow(stem) {
   const initFrac = Math.max(0, Math.min(1, (state?.volume ?? 1) / LANE_VOLUME_MAX));
   val.textContent = String(Math.round(initFrac * 100));
 
-  // Col 6: M button
+  // Col 6: this lane's key, just left of the mute button.
+  //
+  // Laid out along the row like everything beside it. The original version
+  // stacked its buttons vertically next to M and S, which put one widget on the
+  // opposite axis to its neighbours and read as a jumble.
+  const key = makeLaneKey(stem.name, display);
+
+  // Col 7: M button
   const muteBtn = document.createElement("button");
   muteBtn.type = "button";
   muteBtn.className = "lane-icon-toggle mx-btn mute";
   muteBtn.textContent = "M";
-  muteBtn.setAttribute("aria-label", `Mute ${display}`);
+  muteBtn.setAttribute("aria-label", t("aria.mute", { name: display }));
   muteBtn.setAttribute("aria-pressed", String(state?.muted ?? false));
   if (!state?.muted) muteBtn.classList.add("active");
 
@@ -391,7 +570,7 @@ export function renderMixerRow(stem) {
   soloBtn.type = "button";
   soloBtn.className = "solo ms-btn mx-btn";
   soloBtn.textContent = "S";
-  soloBtn.setAttribute("aria-label", `Solo ${display}`);
+  soloBtn.setAttribute("aria-label", t("aria.solo", { name: display }));
   soloBtn.setAttribute("aria-pressed", String(state?.soloed ?? false));
   if (state?.soloed) soloBtn.classList.add("active");
 
@@ -400,7 +579,7 @@ export function renderMixerRow(stem) {
   dl.className = "lane-dl mx-btn";
   dl.href = stem.url;
   dl.download = `${stem.name}.wav`;
-  dl.title = `Download ${display}`;
+  dl.title = t("aria.download", { name: display });
   dl.appendChild(downloadIcon());
 
   // Wrap name + VU in a column so VU appears below the name
@@ -408,15 +587,62 @@ export function renderMixerRow(stem) {
   nameVuCol.className = "lane-name-vu";
   nameVuCol.append(nameEl, vu);
 
-  row.append(iconCell, nameVuCol, fader, val, muteBtn, soloBtn, dl);
+  row.append(iconCell, nameVuCol, fader, val, key, muteBtn, soloBtn, dl);
 
   muteBtn.addEventListener("click", () => toggleStemMute(stem.name));
   soloBtn.addEventListener("click", () => toggleStemSolo(stem.name));
 
   row.classList.toggle("muted", state?.muted ?? false);
   if (state) updateLaneKnobVisual(fader, state.volume);
+  refreshLaneKeyVisual(stem.name);
 
   return { row, vuEl: vu };
+}
+
+/**
+ * The per-lane key stepper: plus above, the reading in the middle, minus below.
+ *
+ * Drums get the control too, disabled and saying why, rather than no control at
+ * all. A missing button on one row reads as a rendering bug; a disabled one
+ * that explains itself teaches the rule.
+ */
+function makeLaneKey(stemName, display) {
+  const wrap = document.createElement("div");
+  wrap.className = "lane-key";
+  wrap.dataset.stem = stemName;
+
+  const up = document.createElement("button");
+  up.type = "button";
+  up.className = "lane-key-step up";
+  up.textContent = "+";
+  up.setAttribute("aria-label", t("aria.laneKeyUp", { name: display }));
+
+  const valueEl = document.createElement("span");
+  valueEl.className = "lane-key-value";
+  valueEl.textContent = "K";
+
+  const down = document.createElement("button");
+  down.type = "button";
+  down.className = "lane-key-step down";
+  // A real minus sign: a hyphen next to a plus sign reads as a dash.
+  down.textContent = "\u2212";
+  down.setAttribute("aria-label", t("aria.laneKeyDown", { name: display }));
+
+  // Plus above, the reading, minus below.
+  wrap.append(up, valueEl, down);
+
+  if (stemName === "drums") {
+    wrap.classList.add("locked");
+    wrap.title = t("mixer.key.drumsLocked");
+    up.disabled = true;
+    down.disabled = true;
+    return wrap;
+  }
+
+  const step = (delta) => setLanePitch(stemName, (mixerState[stemName]?.pitch ?? 0) + delta);
+  up.addEventListener("click", () => step(1));
+  down.addEventListener("click", () => step(-1));
+  return wrap;
 }
 
 // ─── Stem-list panel (Stems sidebar) ───
@@ -450,12 +676,12 @@ export function toggleStemSolo(name) {
 export function soloOnlyStem(name) {
   const state = mixerState[name];
   if (!state) return;
-  const others = TRACK_NAMES.filter((n) => n !== name);
+  const others = allTrackNames().filter((n) => n !== name);
   const isAlreadyAlone = state.soloed && others.every((n) => !mixerState[n]?.soloed);
   if (isAlreadyAlone) {
     state.soloed = false;
   } else {
-    for (const n of TRACK_NAMES) {
+    for (const n of allTrackNames()) {
       if (!mixerState[n]) continue;
       mixerState[n].soloed = (n === name);
     }
@@ -467,7 +693,7 @@ export function soloOnlyStem(name) {
 }
 
 export function resetMixer() {
-  for (const name of TRACK_NAMES) {
+  for (const name of allTrackNames()) {
     const s = mixerState[name];
     if (!s) continue;
     s.volume = 1;
@@ -480,9 +706,13 @@ export function resetMixer() {
 }
 
 export function muteAll() {
-  // Toggle: if every stem is muted, un-mute all; otherwise mute all.
-  const allMuted = STEM_NAMES.every((n) => mixerState[n]?.muted);
-  for (const name of TRACK_NAMES) {
+  // Toggle direction reflects the lanes actually loaded for this job (base 6,
+  // or drums/bass/lead_vocals/backing_vocals/guitar/piano/other when the
+  // on-demand split, #275, is active) rather than always the fixed 6 --
+  // trackIndex is the live "what's actually mounted" source of truth.
+  const loadedNames = Object.keys(trackIndex).filter((n) => n !== "original");
+  const allMuted = loadedNames.length > 0 && loadedNames.every((n) => mixerState[n]?.muted);
+  for (const name of allTrackNames()) {
     const s = mixerState[name];
     if (!s) continue;
     s.muted = !allMuted;
@@ -493,7 +723,7 @@ export function muteAll() {
 }
 
 export function clearAllSolos() {
-  for (const name of TRACK_NAMES) {
+  for (const name of allTrackNames()) {
     const s = mixerState[name];
     if (!s) continue;
     s.soloed = false;

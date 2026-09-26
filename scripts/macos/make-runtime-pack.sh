@@ -129,7 +129,7 @@ SETUPTOOLS_SCM_PRETEND_VERSION="${VERSION#v}" \
   uv pip install --system --python "$PYTHON_DIR/bin/python" "$REPO_ROOT"
 
 echo "==> Verifying stdlib and imports"
-PYTHON_DIR="$PYTHON_DIR" PYTHONHOME="$PYTHON_DIR" "$PYTHON_DIR/bin/python" - <<'PY'
+PYTHON_DIR="$PYTHON_DIR" PYTHONHOME="$PYTHON_DIR" ARCH="$ARCH" "$PYTHON_DIR/bin/python" - <<'PY'
 import importlib, os, pathlib, sys
 
 ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
@@ -143,6 +143,11 @@ packages = [
     "fastapi", "uvicorn", "yt_dlp", "demucs", "torch", "torchaudio",
     "librosa", "pyloudnorm", "soundfile",
 ]
+# audio_separator/onnxruntime (vocal split, #275) are excluded on Intel macOS
+# (x64) -- the feature gates itself off there, matching pyproject.toml's
+# platform marker. Missing here would have caught #407 before release.
+if os.environ.get("ARCH") != "x64":
+    packages += ["audio_separator", "onnxruntime"]
 for package in packages:
     importlib.import_module(package)
     print(f"  OK {package}")
@@ -161,9 +166,58 @@ cat > "$BACKEND_DIR/static/version.json" <<JSON
 }
 JSON
 
+# QuickJS, for YouTube's signature/n-challenge solver (#438). yt-dlp ships the
+# solver script (the yt-dlp-ejs dependency) but needs a JavaScript engine to
+# run it, and a packaged install has nothing on PATH.
+#
+# It rides inside backend/, the same place Windows and Linux put it, so all
+# three packages agree and config.bundled_js_runtime() has one layout to find.
+# Not the app's data directory: on macOS that lives in ~/Library/Application
+# Support and is user-owned, so a binary there would have to be installed at
+# first run rather than shipped.
+#
+# Pinned by version and SHA256, the same rule as the macOS FFmpeg download
+# (#172).
+# ARCH is this script's own value, validated at the top as arm64 or x64. It is
+# not the asset naming, which uses x86_64: mapping between the two is the whole
+# job of this case, and conflating them is what broke the first x64 build.
+QJS_VERSION="v0.16.2"
+case "$ARCH" in
+  arm64) QJS_ASSET="qjs-darwin-arm64";  QJS_SHA256="f6200e9856c45578a5d42ac873a32f3f994b421e29df9f63b452d9c7145015fc" ;;
+  x64)   QJS_ASSET="qjs-darwin-x86_64"; QJS_SHA256="4448991c0500dbe40c7b2f91ba39275995413aa4ee59db3b513b68350908a413" ;;
+  *) echo "ERROR: no QuickJS mapping for ARCH '${ARCH}'" >&2; exit 1 ;;
+esac
+QJS_DIR="${BACKEND_DIR}/jsruntime"
+mkdir -p "$QJS_DIR"
+echo "==> Fetching QuickJS ${QJS_VERSION} (${QJS_ASSET})"
+curl -fsSL --retry 3 -o "${QJS_DIR}/qjs"   "https://github.com/quickjs-ng/quickjs/releases/download/${QJS_VERSION}/${QJS_ASSET}"
+echo "${QJS_SHA256}  ${QJS_DIR}/qjs" | shasum -a 256 -c - >/dev/null || {
+    rm -f "${QJS_DIR}/qjs"
+    echo "QuickJS checksum mismatch" >&2
+    exit 1
+}
+chmod +x "${QJS_DIR}/qjs"
+
+echo "==> Pruning unreachable yt-dlp extractors"
+# yt-dlp ships ~940 site extractors. StemDeck rejects every host but YouTube
+# and SoundCloud before yt-dlp is called, so the rest are unreachable -- and
+# several dozen of them are adult sites, named as such, plus a 15,000-line
+# lazy_extractors.py listing every one of those domains. None of that belongs
+# on a user's disk. Runs before the import check below, so that check doubles
+# The script verifies itself: it re-imports the pruned tree and asserts
+# YouTube and SoundCloud still match.
+"$PYTHON_DIR/bin/python" "${REPO_ROOT}/scripts/prune_ytdlp_extractors.py" \
+  "$PYTHON_DIR/lib/python${PYTHON_VERSION}/site-packages"
+
 echo "==> Capturing dependency inventory"
 mkdir -p "$RUNTIME_DIR/licenses"
 uv pip list --system --python "$PYTHON_DIR/bin/python" --format=json > "$RUNTIME_DIR/licenses/pip-list.json"
+# pip-list.json is names and versions, which is an inventory but not a
+# notice. MIT, BSD and Apache-2.0 all require the copyright line and the
+# license text itself to travel with a binary, so collect those too.
+"$PYTHON_DIR/bin/python" "${REPO_ROOT}/scripts/collect_licenses.py" \
+  "$PYTHON_DIR/lib/python${PYTHON_VERSION}/site-packages" \
+  "$RUNTIME_DIR/licenses"
 
 cat > "$RUNTIME_DIR/runtime-manifest.json" <<JSON
 {
@@ -177,6 +231,20 @@ echo "==> Stripping Python caches"
 find "$PYTHON_DIR" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
 find "$PYTHON_DIR" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
 
+# The ditto above preserves extended attributes on every copied file (#505).
+# macOS tar then serializes those xattrs as AppleDouble "._name" members, and
+# the Rust tar crate that unpacks this archive on the user's machine knows
+# nothing about AppleDouble, so it writes them out as literal files. One of
+# them lands in matplotlib's style directory, where the "*.mplstyle" glob picks
+# it up and chokes on the binary header -- taking down every import of
+# matplotlib.pyplot, and with it allin1_infer and automatic song sections.
+# Strip the xattrs, delete any sidecars already on disk, and tell tar not to
+# regenerate them.
+echo "==> Stripping extended attributes and AppleDouble sidecars"
+xattr -cr "$STAGING" 2>/dev/null || true
+find "$STAGING" -name "._*" -delete
+
+export COPYFILE_DISABLE=1
 ARCHIVE_NAME="StemDeck-runtime-macOS-${ARCH}.tar.zst"
 ARCHIVE_PATH="${BUILD_DIR}/${ARCHIVE_NAME}"
 if command -v zstd >/dev/null 2>&1; then
@@ -185,6 +253,38 @@ else
   ARCHIVE_NAME="StemDeck-runtime-macOS-${ARCH}.tar.gz"
   ARCHIVE_PATH="${BUILD_DIR}/${ARCHIVE_NAME}"
   tar -czf "$ARCHIVE_PATH" -C "$STAGING" runtime
+fi
+
+# The three guards above are all environment-dependent -- whether macOS tar
+# emits AppleDouble members at all varies by OS version -- so verify the actual
+# archive rather than trusting them. A pack that ships even one sidecar is a
+# broken pack.
+#
+# `tar -tf` cannot do this audit: macOS tar folds "._name" members back into
+# their sibling's metadata while listing, exactly as it does while creating, so
+# it reports a clean archive whether or not one is clean. Stream the members
+# through Python's tarfile instead, which has no AppleDouble handling at all.
+echo "==> Verifying archive carries no AppleDouble entries"
+if [[ "$ARCHIVE_PATH" == *.zst ]]; then
+  DECOMPRESS=(zstd -dc "$ARCHIVE_PATH")
+else
+  DECOMPRESS=(gzip -dc "$ARCHIVE_PATH")
+fi
+APPLE_DOUBLE="$("${DECOMPRESS[@]}" | "$PYTHON_BIN" -c '
+import posixpath, sys, tarfile
+
+found = [
+  member.name
+  for member in tarfile.open(fileobj=sys.stdin.buffer, mode="r|")
+  if posixpath.basename(member.name).startswith("._")
+]
+print("\n".join(found[:5]))
+print(f"({len(found)} total)" if found else "", end="")
+')"
+if [[ -n "$APPLE_DOUBLE" ]]; then
+  echo "ERROR: archive contains AppleDouble ._ entries (see #505)" >&2
+  echo "$APPLE_DOUBLE" >&2
+  exit 1
 fi
 
 SIZE="$(stat -f%z "$ARCHIVE_PATH")"

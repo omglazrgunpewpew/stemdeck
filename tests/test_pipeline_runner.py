@@ -10,15 +10,18 @@ from app.core.registry import _jobs
 from app.pipeline.runner import (
     _extract_video_track,
     _presence_from_rms,
+    _run_common,
+    _write_metadata,
     run_local_pipeline,
     run_pipeline,
 )
 
 
 def _ffmpeg_available() -> bool:
-    import shutil
+    # See tests/ffmpeg_probe.py: PATH is not how the app finds ffmpeg.
+    from tests.ffmpeg_probe import ffmpeg_available
 
-    return shutil.which("ffmpeg") is not None
+    return ffmpeg_available()
 
 
 @pytest.mark.asyncio
@@ -150,6 +153,71 @@ async def test_local_pipeline_error_cleans_up_job_dir(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_download_failure_carries_its_message(tmp_path: Path):
+    """#434: a yt-dlp failure has no stderr tail (only SeparationError carries
+    one), so error_detail used to arrive as the bare word "unknown". It must
+    now classify the cause AND carry the message."""
+    job = Job(id="abcdefabcde7")
+    job_dir = tmp_path / job.id
+    job_dir.mkdir(parents=True)
+    source = job_dir / "source.wav"
+    source.write_bytes(b"RIFF" + bytes(64))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm you're not a bot.")
+
+    with patch("app.pipeline.runner._run_local_blocking", side_effect=boom):
+        await run_local_pipeline(job, source, tmp_path)
+
+    assert job.status == "error"
+    assert job.error_detail is not None
+    assert job.error_detail.startswith("source-blocked")
+    assert "Sign in to confirm" in job.error_detail
+    assert job.error_detail != "source-blocked"
+
+
+@pytest.mark.asyncio
+async def test_error_detail_stays_bare_when_exception_has_no_message(tmp_path: Path):
+    """The message fallback must not append an empty separator: a bare cause is
+    correct when there is genuinely nothing to say."""
+    job = Job(id="abcdefabcde8")
+    job_dir = tmp_path / job.id
+    job_dir.mkdir(parents=True)
+    source = job_dir / "source.wav"
+    source.write_bytes(b"RIFF" + bytes(64))
+
+    with patch("app.pipeline.runner._run_local_blocking", side_effect=RuntimeError()):
+        await run_local_pipeline(job, source, tmp_path)
+
+    assert job.error_detail == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_download_failure_message_is_redacted(tmp_path: Path):
+    """error_detail is served to the client and pasted into public reports, so
+    the source URL yt-dlp embeds in its errors must not survive."""
+    job = Job(id="abcdefabcde9")
+    job_dir = tmp_path / job.id
+    job_dir.mkdir(parents=True)
+    source = job_dir / "source.wav"
+    source.write_bytes(b"RIFF" + bytes(64))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError(
+            "ERROR: Unable to download https://www.youtube.com/watch?v=dQw4w9WgXcQ: "
+            "Requested format is not available"
+        )
+
+    with patch("app.pipeline.runner._run_local_blocking", side_effect=boom):
+        await run_local_pipeline(job, source, tmp_path)
+
+    assert job.error_detail is not None
+    assert job.error_detail.startswith("source-unavailable")
+    assert "youtube.com" not in job.error_detail
+    assert "dQw4w9WgXcQ" not in job.error_detail
+
+
+@pytest.mark.asyncio
 async def test_pipeline_error_quarantines_evidence(tmp_path: Path):
     """#277: a failed job's dir moves to jobs/failed/<id> with error.txt
     (device, cause, stderr tail) and the heavy audio payloads stripped."""
@@ -186,6 +254,57 @@ async def test_pipeline_error_quarantines_evidence(tmp_path: Path):
     assert '"download": 1.2' in report
     assert not (quarantined / "source.wav").exists()
     assert not (quarantined / "stems").exists()
+    # Full traceback is captured too (#report-full-stack), not just the
+    # classified cause/tail -- named after the function that actually raised.
+    assert "--- traceback ---" in report
+    assert "in boom" in report
+    assert "SeparationError" in report
+
+
+def test_redact_home_strips_the_users_home_directory():
+    """A traceback carries absolute paths, and on Windows the Python install
+    path alone embeds the reporter's OS username -- this text is headed for a
+    public GitHub issue or Discord message, so it must never reach one raw."""
+    from app.core.redact import redact
+
+    home = str(Path.home())
+    text = f'File "{home}\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\asyncio\\threads.py", line 25'
+    redacted = redact(text)
+    assert home not in redacted
+    assert "<home>" in redacted
+    assert "threads.py" in redacted, "the rest of the path must survive -- it's the useful part"
+
+
+@pytest.mark.asyncio
+async def test_quarantine_redacts_a_source_url_embedded_in_the_exception(tmp_path: Path):
+    """yt-dlp errors often embed the URL they were fetching in the message
+    itself (e.g. "Unsupported URL: <url>") -- exc!r reaching error.txt
+    unredacted would leak it even though title:/source: are already excluded
+    from the public API response."""
+    job = Job(id="abcdefabcde7", source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    job_dir = tmp_path / job.id
+    (job_dir / "stems").mkdir(parents=True)
+    (job_dir / "stems" / "vocals.wav").write_bytes(b"RIFF" + b"\x00" * 64)
+    (job_dir / "source.wav").write_bytes(b"RIFF" + b"\x00" * 64)
+    source = job_dir / "source.wav"
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("Unsupported URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    with patch("app.pipeline.runner._run_local_blocking", side_effect=boom):
+        await run_local_pipeline(job, source, tmp_path)
+
+    report = (tmp_path / "failed" / job.id / "error.txt").read_text(encoding="utf-8")
+    lines = report.splitlines()
+    source_line = next(line for line in lines if line.startswith("source:"))
+    exception_line = next(line for line in lines if line.startswith("exception:"))
+    # title:/source: are local-only (never served by the /failure API) and
+    # keep the real URL, unredacted, for the person looking at their own disk.
+    assert source_line == "source: https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    # exception: IS served by the /failure API, and yt-dlp errors often embed
+    # the URL they were fetching in the message itself -- must be redacted.
+    assert "youtube.com" not in exception_line
+    assert "<source-url-redacted>" in exception_line
 
 
 @pytest.mark.asyncio
@@ -310,3 +429,260 @@ def test_presence_from_rms_empty_input():
 
 def test_presence_from_rms_all_silent():
     assert _presence_from_rms({"vocals": 0.0, "drums": 0.0}) == {"vocals": 0, "drums": 0}
+
+
+def _common_stage_patches(job_dir: Path, sections):
+    section_patch = (
+        patch("app.pipeline.runner.detect_sections", side_effect=sections)
+        if isinstance(sections, BaseException)
+        else patch("app.pipeline.runner.detect_sections", return_value=sections)
+    )
+    return (
+        patch("app.pipeline.runner.analyze"),
+        patch("app.pipeline.runner.separate", return_value=job_dir / "model"),
+        patch("app.pipeline.runner.collect", return_value=["bass", "drums", "vocals"]),
+        patch("app.pipeline.runner.cleanup_source"),
+        patch("app.pipeline.runner.make_original_track", return_value=None),
+        patch("app.pipeline.runner.make_selected_mix", return_value=None),
+        patch("app.pipeline.runner.compute_stem_peaks", return_value={}),
+        patch("app.pipeline.runner.compute_beat_grid"),
+        section_patch,
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_url", "kept"),
+    [
+        ("local:my song.mp3", True),
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", False),
+        # No source recorded at all is not an upload, so it is reclaimed as
+        # before. Nothing depends on holding it.
+        (None, False),
+    ],
+)
+def test_only_a_source_that_can_be_fetched_again_is_deleted(
+    tmp_path: Path, source_url: str | None, kept: bool
+):
+    """An upload's source is the only copy StemDeck will ever have.
+
+    Deleting it is the bulk of disk reclaim per job, which is why it happens
+    at all, but a link can be downloaded again and an upload cannot. Throwing
+    an upload's source away means the track can never be separated again, with
+    any model, and the person who imported it may no longer have the file.
+    """
+    job = Job(id="abcdefabc120", duration_sec=60.0, source_url=source_url)
+    job_dir = tmp_path / job.id
+    (job_dir / "stems").mkdir(parents=True)
+    source = job_dir / "source.mp3"
+    source.write_bytes(b"ID3")
+
+    patches = _common_stage_patches(job_dir, [])
+    # Index 3 is the cleanup_source patch; let the real one run so this
+    # asserts on the file rather than on a call count.
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[4],
+        patches[5],
+        patches[6],
+        patches[7],
+        patches[8],
+    ):
+        _run_common(job, source, job_dir)
+
+    assert source.exists() is kept
+
+
+def test_common_pipeline_stores_automatic_section_suggestions(tmp_path: Path):
+    job = Job(id="abcdefabc111", duration_sec=60.0, auto_sections=True)
+    job_dir = tmp_path / job.id
+    stems_dir = job_dir / "stems"
+    stems_dir.mkdir(parents=True)
+    suggested = [
+        {
+            "id": "auto-001",
+            "name": "Verse",
+            "kind": "verse",
+            "start": 0.0,
+            "end": 60.0,
+            "color": "#00c8a0",
+        }
+    ]
+
+    patches = _common_stage_patches(job_dir, suggested)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patches[5],
+        patches[6],
+        patches[7],
+        patches[8] as detect,
+    ):
+        _run_common(job, job_dir / "source.wav", job_dir)
+
+    assert job.sections == suggested
+    assert job.sections_source == "automatic"
+    detect.assert_called_once_with(job, stems_dir, 60.0)
+    assert "sections" in (job.stage_timings or {})
+
+
+def test_common_pipeline_skips_sections_when_the_user_turned_them_off(tmp_path: Path):
+    """The toggle must stop the inference pass, not just hide its result.
+
+    The flag is captured on the job when it is created, not read when this
+    stage is reached: the stage is the last thing the pipeline does, and the
+    toggle clears itself as soon as the user opens another song.
+    """
+    job = Job(id="abcdefabc116", duration_sec=60.0, auto_sections=False)
+    job_dir = tmp_path / job.id
+    (job_dir / "stems").mkdir(parents=True)
+
+    patches = _common_stage_patches(job_dir, [{"id": "auto-001", "kind": "verse"}])
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patches[5],
+        patches[6],
+        patches[7],
+        patches[8] as detect,
+    ):
+        _run_common(job, job_dir / "source.wav", job_dir)
+
+    detect.assert_not_called()
+    assert job.sections is None
+    assert job.sections_source is None
+
+
+def test_common_pipeline_keeps_section_failure_nonfatal(tmp_path: Path, caplog):
+    job = Job(id="abcdefabc112", duration_sec=60.0, auto_sections=True)
+    job_dir = tmp_path / job.id
+    (job_dir / "stems").mkdir(parents=True)
+    patches = _common_stage_patches(job_dir, RuntimeError("model unavailable"))
+
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patches[5],
+        patches[6],
+        patches[7],
+        patches[8],
+        caplog.at_level("ERROR", logger="stemdeck.pipeline"),
+    ):
+        _run_common(job, job_dir / "source.wav", job_dir)
+
+    assert job.sections is None
+    assert "section analysis stage failed" in caplog.text
+
+
+def test_common_pipeline_preserves_section_cancellation(tmp_path: Path):
+    job = Job(id="abcdefabc113", duration_sec=60.0, auto_sections=True)
+    job_dir = tmp_path / job.id
+    (job_dir / "stems").mkdir(parents=True)
+    patches = _common_stage_patches(job_dir, JobCancelled())
+
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patches[5],
+        patches[6],
+        patches[7],
+        patches[8],
+        pytest.raises(JobCancelled),
+    ):
+        _run_common(job, job_dir / "source.wav", job_dir)
+
+
+def test_common_pipeline_never_reanalyzes_existing_manual_sections(tmp_path: Path):
+    manual = [{"id": "custom", "name": "Pre-Chorus"}]
+    job = Job(
+        id="abcdefabc119",
+        duration_sec=60.0,
+        sections=manual,
+        sections_source="manual",
+    )
+    job_dir = tmp_path / job.id
+    (job_dir / "stems").mkdir(parents=True)
+    patches = _common_stage_patches(job_dir, [{"id": "auto-001"}])
+
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patches[5],
+        patches[6],
+        patches[7],
+        patches[8] as detect,
+    ):
+        _run_common(job, job_dir / "source.wav", job_dir)
+
+    detect.assert_not_called()
+    assert job.sections == manual
+    assert job.sections_source == "manual"
+
+
+def test_metadata_includes_sections_and_source(tmp_path: Path):
+    job = Job(
+        id="abcdefabc114",
+        sections=[{"id": "auto-001"}],
+        sections_source="automatic",
+    )
+    job_dir = tmp_path / job.id
+    job_dir.mkdir()
+
+    _write_metadata(job, job_dir)
+
+    import json as _json
+
+    meta = _json.loads((job_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert meta["sections"] == [{"id": "auto-001"}]
+    assert meta["sections_source"] == "automatic"
+
+
+def test_section_flag_is_captured_at_submit_not_at_the_sections_stage(tmp_path: Path):
+    """Turning the toggle off mid-import must not rob the running job.
+
+    The sections stage is the last thing the pipeline does, minutes after the
+    user pressed the button, and the toggle now clears itself the moment they
+    open another song. Reading the setting here would have let an import
+    silently lose a pass its owner had already asked and waited for, so the
+    answer is the one captured on the job at creation.
+    """
+    job = Job(id="abcdefabc117", duration_sec=60.0, auto_sections=True)
+    job_dir = tmp_path / job.id
+    (job_dir / "stems").mkdir(parents=True)
+
+    suggested = [{"id": "auto-001", "kind": "verse"}]
+    patches = _common_stage_patches(job_dir, suggested)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patches[5],
+        patches[6],
+        patches[7],
+        patches[8] as detect,
+        # The setting says off, the way it would after the user opened another
+        # song while this import was still running.
+        patch("app.core.settings.get_auto_sections", return_value=False),
+    ):
+        _run_common(job, job_dir / "source.wav", job_dir)
+
+    detect.assert_called_once()
+    assert job.sections == suggested

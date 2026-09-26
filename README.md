@@ -17,7 +17,7 @@
 <p align="center"><sub>JOIN THE COMMUNITY</sub></p>
 <div align="center">
   <a href="https://github.com/stemdeckapp/stemdeck"><img src="https://img.shields.io/badge/GitHub-stemdeckapp-181717?style=flat-square&logo=github&logoColor=white" alt="GitHub"></a>
-  <a href="https://discord.gg/2MVsWqaPRe"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://discord.gg/YhCKsjhcwB"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://www.reddit.com/r/StemDeckApp/"><img src="https://img.shields.io/badge/Reddit-r%2FStemDeckApp-FF4500?style=flat-square&logo=reddit&logoColor=white" alt="Reddit"></a>
   <a href="https://www.instagram.com/stemdeck"><img src="https://img.shields.io/badge/Instagram-stemdeck-E4405F?style=flat-square&logo=instagram&logoColor=white" alt="Instagram"></a>
   <a href="https://x.com/StemDeckApp"><img src="https://img.shields.io/badge/X-StemDeckApp-000000?style=flat-square&logo=x&logoColor=white" alt="X"></a>
@@ -28,28 +28,48 @@
 
 <br>
 
-Drop in an MP3, WAV, or FLAC file, or paste a YouTube URL, and StemDeck splits the audio into up to six stems (vocals, drums, bass, guitar, piano, other). Play them back in a DAW-style multitrack mixer: mute, solo, balance levels, zoom the waveform, loop a region, and export individual stems or a custom mix. Everything runs locally on your own machine.
+Drop in an MP3, WAV, FLAC, OGG/Opus, MP4, or M4A file, or paste a YouTube URL, and StemDeck splits the audio into up to six stems (vocals, drums, bass, guitar, piano, other). Play them back in a DAW-style multitrack mixer: mute, solo, balance levels, zoom the waveform, loop a region, and export individual stems or a custom mix. Everything runs locally on your own machine.
 
-> **What is this?** StemDeck is a stem separation tool, not a downloader. Its main job is processing audio you already own: drag an MP3, WAV, or FLAC onto the import bar and go. YouTube support is a convenience for content you have the right to process. StemDeck does not store, cache, or redistribute any downloaded content. Everything happens locally and nothing leaves your machine.
+> **What is this?** StemDeck is a stem separation tool, not a downloader. Its main job is processing audio you already own: drag an MP3, WAV, FLAC, OGG, or M4A onto the import bar and go. YouTube support is a convenience for content you have the right to process. StemDeck does not store, cache, or redistribute any downloaded content. Everything happens locally and nothing leaves your machine.
 
 > StemDeck is a free, open alternative to cloud stem-splitters like Moises and LALAL.AI: no account, no quota, no uploads, no subscription. If you want stems for personal study and prefer to keep things local and free, StemDeck has you covered. If you need the polish, a mobile app, or deeper musician tooling, the commercial products are a better fit.
 
 ![StemDeck screenshot](imgs/screenshot/stemdeck.png)
 
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=stemdeckapp%2Fstemdeck&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=stemdeckapp/stemdeck&type=date&theme=dark&legend=top-left&sealed_token=ZCLzbiDb9k7qGcBlGZ4Y7ztZz0mepkiAVraLOc4qeVQjSM_MfPIQD7P9n2wvwBM8mw8EKfkSAQfM2vByzi3mEPklzgSWtYnVzZsfexzb7LxwoATlrgSmWesQiwczpg4xa32nF4_Np1Qpe62s5eFsl0o46JzPuwwd5M6pwShbj1PfDMFD4b0Yuu0jH3rD" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=stemdeckapp/stemdeck&type=date&legend=top-left&sealed_token=ZCLzbiDb9k7qGcBlGZ4Y7ztZz0mepkiAVraLOc4qeVQjSM_MfPIQD7P9n2wvwBM8mw8EKfkSAQfM2vByzi3mEPklzgSWtYnVzZsfexzb7LxwoATlrgSmWesQiwczpg4xa32nF4_Np1Qpe62s5eFsl0o46JzPuwwd5M6pwShbj1PfDMFD4b0Yuu0jH3rD" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=stemdeckapp/stemdeck&type=date&legend=top-left&sealed_token=ZCLzbiDb9k7qGcBlGZ4Y7ztZz0mepkiAVraLOc4qeVQjSM_MfPIQD7P9n2wvwBM8mw8EKfkSAQfM2vByzi3mEPklzgSWtYnVzZsfexzb7LxwoATlrgSmWesQiwczpg4xa32nF4_Np1Qpe62s5eFsl0o46JzPuwwd5M6pwShbj1PfDMFD4b0Yuu0jH3rD" />
+ </picture>
+</a>
+
 ## We Recommend
 
-StemDeck is free and **does not accept any money, sponsorship, or funding** - not from users, not from anyone listed below. We share these makers and artists purely for the joy of pointing you toward wonderful people doing beautiful work. Go meet them ❤️
+StemDeck is free and **does not accept any money, sponsorship, or funding**  from anyone listed below. I share these makers and artists and communities purely for the joy of pointing you toward wonderful people doing beautiful work. Go meet them ❤️
 
-| Name | What they do | Link |
-|---|---|---|
-| Dlima Guitars | Custom guitars and basses | [@dlimaguitars](https://www.instagram.com/dlimaguitars) |
-| Lisbon Guitar Works | Guitar building | [dlimaguitars.com](https://dlimaguitars.com) |
-| Joao Gaspar | Producer/Film Scorer, Touring/Session Musician | [@jay_glaspar](https://www.instagram.com/jay_glaspar) |
-| Kris Luthier | Luthier and Musical Instrument Repair, Lisboa | [@krisluthier](https://www.instagram.com/krisluthier) |
-| Thomann | Online Music Store | [@thomann.music](https://www.instagram.com/thomann.music) |
-| Analog4Lyfe | Analog music gear | [@analog4lyfe](https://www.instagram.com/analog4lyfe) |
-| Empress Effects | Effects pedals | [empresseffects.com](https://empresseffects.com) |
-| More Notes Less Talk | Instruments and gear with personality, recorded raw to tape. No hype, no gatekeeping. | [@morenoteslesstalk](https://www.youtube.com/@morenoteslesstalk) |
+| Category | Name | What they do | Link |
+|---|---|---|---|
+| Artists & Creators | Joao Gaspar | Producer, film scorer, touring/session musician | [@jay_glaspar](https://www.instagram.com/jay_glaspar) |
+| Artists & Creators | Killah Trakz | Industry Secret Villain and Media Influencer | [@killahtrakz](https://www.instagram.com/killahtrakz/) |
+| Artists & Creators | More Notes Less Talk | Gear-focused creative project with a raw, tape-recorded identity | [@morenoteslesstalk](https://www.youtube.com/@morenoteslesstalk) |
+| Artists & Creators | Analog4Lyfe | Analog gear specialist | [@analog4lyfe](https://www.instagram.com/analog4lyfe) |
+| Artists & Creators | Dead röses | Cork-based punk rock band | [@dead_rosesband](https://www.instagram.com/dead_rosesband) |
+| Artists & Creators | NIHIL | Modern alternative metal from Argentina. Fueled by emotionally charged vocals, anger and emptiness | [@somosnihil](https://www.instagram.com/somosnihil/) |
+| Instrument Builders & Repair | Dlima Guitars | Custom guitars and basses | [@dlimaguitars](https://www.instagram.com/dlimaguitars) |
+| Instrument Builders & Repair | Lisbon Guitar Works | Handmade guitars in Lisbon | [dlimaguitars.com](https://dlimaguitars.com) |
+| Instrument Builders & Repair | Kris Luthier | Instrument repair and restoration | [@krisluthier](https://www.instagram.com/krisluthier) |
+| Music Gear | Empress Effects | Boutique effects pedals | [empresseffects.com](https://empresseffects.com) |
+| Music Gear | Thomann | Large music-equipment retailer | [@thomann.music](https://www.instagram.com/thomann.music) |
+| Music & Karaoke Technology | Beltr | Local, subscription-free karaoke software | [beltr.app](https://beltr.app/) |
+| Music & Karaoke Technology | Seratone | TV-based karaoke system | [seratone.audio](https://seratone.audio/) |
+| Media & Community | slashCAM | Camera, video, and post-production media | [@slashcam.de](https://www.instagram.com/slashcam.de) |
+| Media & Community | r/bass | Bass-player community | [r/Bass](https://www.reddit.com/r/Bass) |
+| Media & Community | Not Another Audio Podcast | Audio, music and tech industry podcast by working professionals | [Libsyn](https://directory.libsyn.com/shows/view/id/20f5a1e3-6fea-4d41-8cdf-451ce6fc6cda) |
+| Writers & Storytellers | Alexandre Borges | Portuguese writer, screenwriter, and cultural commentator | [Books & author profile](https://www.instagram.com/alexgram_b/) |
 
 
 ---
@@ -58,7 +78,7 @@ StemDeck is free and **does not accept any money, sponsorship, or funding** - no
 
 **6-stem separation** via Demucs `htdemucs_6s`, with auto-detection of the best Torch device (CUDA on NVIDIA, MPS on Apple Silicon, CPU fallback).
 
-**YouTube and local file import.** Paste a YouTube URL or drop an MP3 or WAV directly onto the import bar.
+**YouTube and local file import.** Paste a YouTube URL or drop an MP3, WAV, FLAC, OGG/Opus, MP4, or M4A directly onto the import bar.
 
 **DAW-style waveform editor** with min/max sample rendering across all stems, shared normalization, zoom in/out/Fit, loop drag on the ruler, gold playhead overlay, and stem-aligned lanes.
 
@@ -94,7 +114,7 @@ StemDeck is not trying to compete with commercial stem-separation products. It c
 | **Data retention** | You control it; delete anytime | Governed by their privacy policy and retention period |
 | **Stem model** | Demucs `htdemucs_6s` (open source, Meta AI) | Proprietary models, regularly updated, generally higher quality |
 | **Stem count** | 6 (vocals, drums, bass, guitar, piano, other) | Up to 10 depending on service and plan |
-| **Input formats** | YouTube URL, MP3, WAV | MP3, WAV, FLAC, M4A, and more depending on service |
+| **Input formats** | YouTube URL, MP3, WAV, FLAC, OGG/Opus, MP4, M4A | MP3, WAV, FLAC, M4A, and more depending on service |
 | **Processing speed** | Depends on your hardware; fast with a GPU, slow on CPU only | Fast regardless of your hardware (runs on their servers) |
 | **Batch processing** | One job at a time | Yes, on paid plans |
 | **Mobile app** | No | iOS and Android |
@@ -128,7 +148,7 @@ macOS may show a Gatekeeper prompt on first open — right-click the app and cho
 | `StemDeck-Windows-x64.zip` | CPU only | ~700 MB |
 | `StemDeck-Windows-x64.NVIDIA.zip` | NVIDIA CUDA | ~1.6 GB |
 
-Extract the zip anywhere, run `StemDeck.exe`. On first launch the app verifies the bundled Python runtime and downloads FFmpeg and the Demucs model (~170 MB). Subsequent launches skip this and start in seconds. Everything is self-contained; no Python or system dependencies required.
+Extract the zip anywhere, run `StemDeck.exe`. FFmpeg, the Demucs model, config, and logs live in a `data/` folder next to `StemDeck.exe`, not in AppData; move or copy the whole extracted folder anywhere and it keeps working. On first launch the app verifies the bundled Python runtime and downloads FFmpeg and the Demucs model (~170 MB) into that folder. Subsequent launches skip this and start in seconds. Everything is self-contained; no Python or system dependencies required. Your job/library data stays in its usual location (`~/Documents/StemDeck` by default) and is relocatable anytime from Settings → StemData location.
 
 ---
 
@@ -142,7 +162,7 @@ Extract the zip anywhere, run `StemDeck.exe`. On first launch the app verifies t
 
 <br>
 
-StemDeck is built on **[Python 3.12](https://python.org)** managed via **[uv](https://github.com/astral-sh/uv)**, with a **[FastAPI](https://fastapi.tiangolo.com)** backend serving REST and Server-Sent Events. Stem separation uses **[Demucs](https://github.com/facebookresearch/demucs)** (`htdemucs_6s`), Meta AI's open-source 6-stem neural network. YouTube audio is fetched via **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**; transcoding and mixing use **[FFmpeg](https://ffmpeg.org)**. BPM detection and key analysis run on **[librosa](https://librosa.org)**; loudness measurement uses **[pyloudnorm](https://github.com/csteinmetz1/pyloudnorm)** (ITU-R BS.1770). The macOS and Windows desktop shells are **[Tauri v2](https://tauri.app)** (Rust/WKWebView on macOS, Rust/WebView2 on Windows). The frontend is vanilla JS with the Web Audio API, no framework and no build step; waveforms are rendered on `<canvas>` using min/max sample rendering.
+StemDeck is built on **[Python 3.12](https://python.org)** managed via **[uv](https://github.com/astral-sh/uv)**, with a **[FastAPI](https://fastapi.tiangolo.com)** backend serving REST and Server-Sent Events. Stem separation uses **[Demucs](https://github.com/facebookresearch/demucs)** (`htdemucs_6s`), Meta AI's open-source 6-stem neural network. The optional on-demand lead/backing vocal split runs the UVR-MDX-NET Karaoke 2 model via **[audio-separator](https://github.com/nomadkaraoke/python-audio-separator)**, trained as part of the **[Ultimate Vocal Remover](https://github.com/Anjok07/ultimatevocalremovergui)** project by Anjok07. YouTube audio is fetched via **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**; transcoding and mixing use **[FFmpeg](https://ffmpeg.org)**. BPM detection and key analysis run on **[librosa](https://librosa.org)**; loudness measurement uses **[pyloudnorm](https://github.com/csteinmetz1/pyloudnorm)** (ITU-R BS.1770). The macOS and Windows desktop shells are **[Tauri v2](https://tauri.app)** (Rust/WKWebView on macOS, Rust/WebView2 on Windows). The frontend is vanilla JS with the Web Audio API, no framework and no build step; waveforms are rendered on `<canvas>` using min/max sample rendering.
 
 *Thanks to the creators and maintainers of all the open-source libraries that make StemDeck possible.*
 
@@ -215,7 +235,7 @@ Install prerequisites:
 ```powershell
 git clone https://github.com/stemdeckapp/stemdeck stemdeck; cd stemdeck
 uv sync
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
 ```
 
 Open <http://localhost:8000>.
@@ -227,7 +247,7 @@ Open <http://localhost:8000>.
 ```powershell
 uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 $env:STEMDECK_DEMUCS_DEVICE = "cuda"
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
 ```
 
 ---
@@ -237,8 +257,13 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```sh
 git clone https://github.com/stemdeckapp/stemdeck stemdeck && cd stemdeck
 uv sync
-uv run uvicorn app.main:app --reload
+uv run uvicorn app.main:app --reload --timeout-graceful-shutdown 5
 ```
+
+> `--timeout-graceful-shutdown` bounds how long uvicorn waits for open
+> connections when you stop it. StemDeck keeps a long-lived SSE stream open
+> for the import queue while a browser tab is on the app, so without it
+> Ctrl-C waits for that stream instead of exiting.
 
 #### Docker
 
@@ -284,7 +309,7 @@ The library is persistent by default (`STEMDECK_PERSIST_LIBRARY=1`), so tracks a
 ## How to Use
 
 1. On the import bar, click stem chips to choose which stems to extract (defaults to all 6).
-2. Paste a YouTube URL **or** drop an MP3/WAV file, then click **Process**.
+2. Paste a YouTube URL **or** drop an audio file (MP3, WAV, FLAC, OGG, MP4, M4A), then click **Process**.
 3. Wait through `Uploading...` / `Downloading...` → `Analyzing...` → `Separating...` → `Mixing tracks...`.
 4. When done, the studio dashboard appears. If you picked a subset, the first lane is **Original** (full song minus your selection); the rest are your isolated stems.
 5. Mix: **Play/Pause/Stop** controls the master transport. **M** mutes a stem, **S** solos it (additive; multiple solos stay audible), **Monitor** solos only that stem and clears others. The volume fader moves 1:1 with drag; double-click resets to 0 dB; `Shift+wheel` gives coarse adjustment and plain wheel gives fine. The **Reset**, **Mute**, and **Solo** toolbar buttons act on all stems at once.
@@ -316,8 +341,65 @@ The library is persistent by default (`STEMDECK_PERSIST_LIBRARY=1`), so tracks a
 | `STEMDECK_TIMEOUT_FFMPEG` | `300` | ffmpeg subprocess timeout (seconds). |
 | `STEMDECK_TIMEOUT_ANALYZE` | `120` | Audio analysis timeout (seconds). |
 | `STEMDECK_TIMEOUT_DEMUCS_STALL` | `1800` | Kill Demucs if no output for this many seconds. |
+| `STEMDECK_SSL_CERT` | (none) | PEM certificate; set with the key below to serve https directly. |
+| `STEMDECK_SSL_KEY` | (none) | PEM private key for the certificate above. |
+| `STEMDECK_HTTPS_PORT` | (none) | Serve https on this port *in addition* to the main listener. Set by the desktop app; see below. |
 
 `run.sh` also reads: `HOST` (default `127.0.0.1`), `PORT` (default `8765`), `RELOAD=1` (enable uvicorn auto-reload for development), `FOREGROUND=1` (run in foreground instead of backgrounding).
+
+### Serving other devices: why https is not optional
+
+Transpose is built on `AudioWorklet`, and browsers grant that only to a
+**secure context**. `https://` and `localhost` qualify. A plain
+`http://192.168.1.20:8000` does not, so a phone reaching StemDeck over plain
+http gets working playback and a key control that cannot do anything. There is
+no fallback worth shipping: driving the same DSP from a `ScriptProcessorNode`
+measured around 5% of the audio missing, because that node type drops buffers
+on its own at every size.
+
+So a server that other devices will use terminates TLS, one of three ways:
+
+1. **A reverse proxy** (SWAG, Nginx Proxy Manager, Traefik, Caddy). The usual
+   self-hosted shape, and the best one if you already run it. StemDeck reads
+   `X-Forwarded-Proto` and the RFC 7239 `Forwarded` header, so an https browser
+   over a plain-http upstream hop is recognised as secure and served normally.
+2. **StemDeck itself**, by pointing `STEMDECK_SSL_CERT` and `STEMDECK_SSL_KEY`
+   at a certificate and key. uvicorn serves them directly; no extra package is
+   installed for this.
+3. **A private overlay network** such as Tailscale, whose addresses are already
+   https.
+
+Reaching a plaintext non-local origin with none of those in place is refused
+with a 403 that explains this, rather than served as an app that is quietly
+half-broken. Loopback is always served, so turning this on can never lock the
+host out of its own server.
+
+### The desktop app runs two listeners
+
+The desktop app does the same thing without being configured, because it has
+two audiences that need opposite things.
+
+- **Plain http on `127.0.0.1`** for its own window. Loopback is already a
+  secure context, so nothing is lost, and it is the only scheme that works: a
+  self-signed certificate would raise a warning page the app window has no way
+  to click through.
+- **https on the LAN**, port 8443 by default, for phones and other computers.
+  This is the address Settings shows and the QR code points at.
+
+Both listeners serve the same process, so there is one library, one queue and
+one Demucs worker either way.
+
+The certificate is generated on your own machine the first time you enable
+network access, and lives in `<data>/certs/` beside `jobs/` and
+`settings.json`. Nothing is shipped in the download: a certificate in the
+release would publish its private key to everyone who downloaded it, which is
+worse than plain http because it looks secure. It is regenerated automatically
+when your machine's addresses change or the certificate is close to expiring.
+
+Because it is signed by nobody, **your phone will show a "your connection is
+not private" warning the first time**. Tap Advanced, then Continue. Once per
+device, per computer. Settings says so, in red, next to the toggle.
+
 
 ---
 
@@ -348,6 +430,14 @@ The library is persistent by default (`STEMDECK_PERSIST_LIBRARY=1`), so tracks a
 **First separation is very slow:** Demucs downloads `htdemucs_6s` weights (~170 MB) on first run; cached afterwards.
 
 **Demucs runs on CPU only:** check the startup log for `device=mps` or `device=cuda`. If you see `cpu`, your torch install may be CPU-only.
+
+**Transpose is greyed out on another machine:** the pitch stage is built on `AudioWorklet`, which browsers only expose on a *secure context*. `https://` and `localhost` count. A plain `http://192.168.x.x` does not, so a client opening StemDeck over the network is never given the API and transpose cannot work there. Changing the speed still works on such a client, but it resamples instead, so the key moves with it.
+
+Three ways to get a secure context, in order of least effort:
+
+- **Tunnel to localhost.** On the client: `ssh -N -L 8000:localhost:8000 user@host`, then open `http://localhost:8000`. The origin is now localhost, so everything works, including transpose.
+- **Tailscale Serve.** `tailscale serve 8000` on the host publishes StemDeck on your tailnet over real HTTPS with a genuine certificate, no warnings and nothing to install on the client beyond Tailscale itself. Note the plain Tailscale IP (`100.x.y.z`) is *not* a secure context; it has to go through `serve`.
+- **Any HTTPS reverse proxy** in front of StemDeck: Caddy, nginx, or a tunnel like Cloudflare Tunnel.
 
 **Page reloaded mid-job:** the job keeps running server-side. Wait for it to finish, then resubmit.
 
@@ -386,16 +476,26 @@ The author(s) of StemDeck provide this software "as is", without warranty of any
 
 ---
 
+## License
+
+StemDeck is [Apache-2.0](LICENSE).
+
+Every download ships a `THIRD_PARTY_NOTICES.txt` and a `licenses/` folder. `licenses/INDEX.txt` lists each packaged Python dependency with its version and license, and each one's full license text sits beside it. That inventory is generated from the packaged interpreter at build time, so it describes what actually shipped rather than what was expected to.
+
+FFmpeg is a GPL build. StemDeck downloads it and runs it as a separate executable, so it does not change StemDeck's own license, and `THIRD_PARTY_NOTICES.txt` carries the written offer of source for the exact build your platform receives.
+
+---
+
 ## Community
 
 | Platform | Link |
 |---|---|
 | GitHub | [stemdeckapp/stemdeck](https://github.com/stemdeckapp/stemdeck) |
-| Discord | [discord.gg/2MVsWqaPRe](https://discord.gg/2MVsWqaPRe) |
+| Discord | [discord.gg/YhCKsjhcwB](https://discord.gg/YhCKsjhcwB) |
 | Reddit | [r/StemDeckApp](https://www.reddit.com/r/StemDeckApp/) |
 | Instagram | [@stemdeck](https://www.instagram.com/stemdeck) |
 | X | [@StemDeckApp](https://x.com/StemDeckApp) |
-| Website | [stemdeck.app](https://stemdeck.app) *(coming soon)* |
+| Website | [stemdeck.app](https://stemdeck.app) |
 
 ---
 
@@ -416,5 +516,3 @@ These are for development and testing. Release builds only recognize the variabl
 ## Contributing
 
 Issues, feature suggestions, and pull requests are welcome. See open issues for what's planned.
-
----

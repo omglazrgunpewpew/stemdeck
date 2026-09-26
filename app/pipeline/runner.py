@@ -6,13 +6,17 @@ import logging
 import shutil
 import subprocess
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 from app.core.config import DEMUCS_MODEL, TIMEOUT_FFMPEG
 from app.core.models import Job, JobCancelled, _set
+from app.core.redact import redact
+from app.core.registry import is_upload, set_proc
 from app.core.registry import persist as persist_registry
 from app.pipeline.analyze import analyze
+from app.pipeline.beatgrid import compute_beat_grid
 from app.pipeline.collect import (
     cleanup_source,
     collect,
@@ -22,6 +26,7 @@ from app.pipeline.collect import (
 )
 from app.pipeline.download import download
 from app.pipeline.errors import classify_failure
+from app.pipeline.sections import detect_sections
 from app.pipeline.separate import separate
 
 logger = logging.getLogger("stemdeck.pipeline")
@@ -43,6 +48,30 @@ _pipeline_lock = asyncio.Semaphore(1)
 def _check_cancel(job: Job) -> None:
     if job.cancel_requested:
         raise JobCancelled()
+
+
+def _run_registered_ffmpeg(job: Job, cmd: list[str], timeout: int) -> tuple[int, bytes]:
+    """Run ffmpeg with the process registered, so cancel can reach it.
+
+    subprocess.run() cannot be interrupted: POST /cancel sets the flag, but
+    nothing looks at it until the call returns, so a cancel during a large
+    upload's transcode was a no-op for up to TIMEOUT_FFMPEG per call -- twice
+    over on the .mp4 path, which runs both this and the video extract (#519).
+
+    Mirrors collect._run_ffmpeg, which registers for exactly this reason.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    set_proc(job.id, proc)
+    try:
+        try:
+            _, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+        return proc.returncode, stderr or b""
+    finally:
+        set_proc(job.id, None)
 
 
 def _extract_video_track(job: Job, source: Path, job_dir: Path) -> None:
@@ -71,12 +100,22 @@ def _extract_video_track(job: Job, source: Path, job_dir: Path) -> None:
         "-y",
         str(dest),
     ]
-    result = subprocess.run(cmd, capture_output=True, timeout=TIMEOUT_FFMPEG)
-    if result.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+    try:
+        returncode, _ = _run_registered_ffmpeg(job, cmd, TIMEOUT_FFMPEG)
+    except (OSError, subprocess.SubprocessError) as e:
+        # ffmpeg missing or timed out. Distinct from an .mp4 that simply has no
+        # video stream, and the only one of the two worth surfacing (#436).
         dest.unlink(missing_ok=True)
+        job.video_status = "failed"
+        logger.warning("video extract failed for job %s: %s", job.id, e)
+        return
+    if returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+        dest.unlink(missing_ok=True)
+        job.video_status = "unavailable"
         logger.info("no video track preserved for job %s (source has no video stream?)", job.id)
         return
     job.has_video = True
+    job.video_status = "ok"
 
 
 def _prepare_local_source(job: Job, source: Path, job_dir: Path) -> Path:
@@ -113,10 +152,10 @@ def _prepare_local_source(job: Job, source: Path, job_dir: Path) -> Path:
         "-y",
         str(dest),
     ]
-    result = subprocess.run(cmd, capture_output=True, timeout=TIMEOUT_FFMPEG)
-    if result.returncode != 0:
+    returncode, stderr = _run_registered_ffmpeg(job, cmd, TIMEOUT_FFMPEG)
+    if returncode != 0:
         raise RuntimeError(
-            "ffmpeg transcode failed: " + result.stderr.decode("utf-8", errors="replace").strip()
+            "ffmpeg transcode failed: " + stderr.decode("utf-8", errors="replace").strip()
         )
     source.unlink(missing_ok=True)
     return dest
@@ -158,10 +197,16 @@ def _run_common(job: Job, source: Path, job_dir: Path) -> None:
     mark = _lap(job, "separate", mark)
     found = collect(job, stems_root, job_dir)
     stems_dir = job_dir / "stems"
-    # Source (100-300 MB or the local upload) is no longer needed after
-    # collect; delete it before the ffmpeg amix steps in case scratch space
-    # is tight.
-    cleanup_source(job_dir)
+    # Deleting the source is the bulk of disk reclaim per job, and it happens
+    # before the ffmpeg amix steps below in case scratch space is tight. But
+    # only a job that can fetch its source again is allowed to give it up.
+    #
+    # An upload is the one copy StemDeck will ever have. Throwing it away means
+    # the track can never be separated again -- not with a different model, not
+    # at all -- and the person who imported it may no longer have the file
+    # either. A link costs a re-download; an upload costs the recording.
+    if not is_upload(job):
+        cleanup_source(job_dir)
     job.stems = [{"name": name, "url": f"/api/jobs/{job.id}/stems/{name}.wav"} for name in found]
     _check_cancel(job)
     _set(job, stage="Mixing tracks...")
@@ -190,7 +235,39 @@ def _run_common(job: Job, source: Path, job_dir: Path) -> None:
     job.stem_presence = _presence_from_rms(
         {name: rms for name, rms in rms_values.items() if name in found}
     )
-    _lap(job, "post", mark)
+    mark = _lap(job, "post", mark)
+
+    # Beat grid for the click track. Runs last and swallows its own failures:
+    # by this point the job is fully usable, and a missing grid only costs the
+    # metronome. compute_beat_grid never raises, but the guard stays so a
+    # future change there can't take the whole pipeline down with it.
+    try:
+        compute_beat_grid(stems_dir)
+    except Exception:
+        logger.exception("beat grid stage failed for job %s", job.id)
+    mark = _lap(job, "beatgrid", mark)
+
+    # Automatic sections are suggestions and never make an otherwise usable
+    # separation fail. Cancellation remains authoritative so a user can still
+    # stop a long CPU inference pass immediately.
+    #
+    # The flag comes from the job, captured when it was created, not from the
+    # setting as it stands now. This stage is the last thing the pipeline does,
+    # so "now" can be many minutes after the user asked -- and the toggle clears
+    # itself on the next song they open. Reading it here let an import silently
+    # lose a pass its owner had already waited for.
+    _check_cancel(job)
+    if job.auto_sections and job.sections is None and job.duration_sec and job.duration_sec > 0:
+        _set(job, stage="Analyzing song structure...")
+        try:
+            sections = detect_sections(job, stems_dir, job.duration_sec)
+            if sections:
+                _set(job, sections=sections, sections_source="automatic")
+        except JobCancelled:
+            raise
+        except Exception:
+            logger.exception("section analysis stage failed for job %s", job.id)
+    _lap(job, "sections", mark)
 
 
 def _run_blocking(job: Job, url: str, job_dir: Path) -> None:
@@ -223,8 +300,11 @@ def _write_metadata(job: Job, job_dir: Path) -> None:
         "dynamic_range": job.dynamic_range,
         "tempo_stability": job.tempo_stability,
         "stem_presence": job.stem_presence,
+        "sections": job.sections,
+        "sections_source": job.sections_source,
         "tags": job.tags,
         "has_video": job.has_video,
+        "video_status": job.video_status,
         "compute_device": job.compute_device,
         "gpu_fallback": job.gpu_fallback,
         "stage_timings": job.stage_timings,
@@ -245,18 +325,35 @@ def _quarantine_failed_job(job: Job, job_dir: Path, jobs_dir: Path, exc: Excepti
     """Preserve failure evidence instead of destroying it (#277).
 
     Writes error.txt (stage, device, model, timings, classified cause, stderr
-    tail), strips the heavy audio payloads, and moves the dir to
-    jobs/failed/<id> where sweep_failed_jobs expires it after FAILED_TTL.
+    tail, full traceback), strips the heavy audio payloads, and moves the dir
+    to jobs/failed/<id> where sweep_failed_jobs expires it after FAILED_TTL.
     Best-effort throughout: any step failing falls back to plain removal so a
     pathological error can never leak disk."""
     tail: list[str] = getattr(exc, "tail", None) or []
     cause = classify_failure("\n".join([*tail, repr(exc)]))
     detail = cause
-    if tail:
-        detail += f" — {tail[-1][:200]}"
+    # error_detail reaches the client directly (job state, notification card,
+    # and the report URL's "what" field) -- redact before the [:200] truncation,
+    # not after, so a redaction placeholder never gets cut in half.
+    #
+    # Prefer the stderr tail, which only SeparationError carries. Without the
+    # fallback, every yt-dlp failure arrived as the bare word "unknown" with no
+    # message at all, and the only way to find out what happened was to read
+    # data/logs/ (#434).
+    message = redact(tail[-1]) if tail else redact(str(exc))
+    if message.strip():
+        detail += f" — {message[:200]}"
     job.error_detail = detail
 
     try:
+        # title/source stay unredacted: they never leave this file (the
+        # /failure API's allowlist excludes both, see app/api/jobs.py), so
+        # this is purely local diagnostic value for the person looking at
+        # their own disk. Everything below IS served to the client and is
+        # redacted accordingly -- exc!r can embed a source URL (yt-dlp errors
+        # often do), and the stderr tail/traceback can carry either a source
+        # URL or the reporter's home directory.
+        redacted_tail = [redact(line) for line in tail]
         lines = [
             f"time: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
             f"job: {job.id}",
@@ -267,10 +364,13 @@ def _quarantine_failed_job(job: Job, job_dir: Path, jobs_dir: Path, exc: Excepti
             f"model: {DEMUCS_MODEL}",
             f"cause: {cause}",
             f"timings: {json.dumps(job.stage_timings) if job.stage_timings else '(none)'}",
-            f"exception: {exc!r}",
+            f"exception: {redact(repr(exc))}",
         ]
-        if tail:
-            lines += ["", "--- stderr tail ---", *tail]
+        if redacted_tail:
+            lines += ["", "--- stderr tail ---", *redacted_tail]
+        tb = redact("".join(traceback.format_exception(type(exc), exc, exc.__traceback__))).rstrip()
+        if tb:
+            lines += ["", "--- traceback ---", tb]
         (job_dir / "error.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         # Strip heavy payloads: the quarantine keeps diagnostics, not audio.

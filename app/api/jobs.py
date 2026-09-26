@@ -3,33 +3,62 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
 import re
 import shutil
 import subprocess
+import threading
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, field_validator
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, Field, field_validator
 
-from app.core.config import JOB_ID_RE, JOBS_DIR, MAX_PENDING_JOBS, STEM_NAMES, ffprobe_executable
-from app.core.models import Job
+from app.core.config import (
+    JOB_ID_RE,
+    JOBS_DIR,
+    MAX_PENDING_UPLOAD_JOBS,
+    MAX_PENDING_URL_JOBS,
+    STEM_NAMES,
+    ffprobe_executable,
+)
+from app.core.models import Job, _set
 from app.core.registry import all_jobs as registry_all_jobs
 from app.core.registry import get as registry_get
 from app.core.registry import get_proc as registry_get_proc
+from app.core.registry import mark_deleted as registry_mark_deleted
+from app.core.registry import pending_count as registry_pending_count
 from app.core.registry import persist as registry_persist
 from app.core.registry import register_if_capacity as registry_register_if_capacity
 from app.core.registry import remove as registry_remove
-from app.core.settings import get_max_duration_sec
-from app.pipeline import run_local_pipeline, run_pipeline
+from app.core.registry import set_trashed as registry_set_trashed
+from app.core.settings import get_auto_sections, get_max_duration_sec
+from app.core.stems_location import is_relocating
+from app.pipeline import jobqueue
+from app.pipeline.collect import merge_stem_peaks, presence_for_split
 from app.pipeline.download import InvalidYouTubeURL, validate_youtube_url
+from app.pipeline.errors import classify_failure
+from app.pipeline.runner import _pipeline_lock
+from app.pipeline.vocal_split import split_vocals
 
 router = APIRouter(tags=["jobs"])
 logger = logging.getLogger("stemdeck.api")
 
-_ALLOWED_EXTS = frozenset((".mp3", ".wav", ".flac", ".mp4", ".m4a"))
+_ALLOWED_EXTS = frozenset((".mp3", ".wav", ".flac", ".mp4", ".m4a", ".ogg", ".opus"))
 _MAX_UPLOAD_BYTES = 400 * 1024 * 1024  # 400 MB
 _WS_RE = re.compile(r"\s+")
+
+# Now that imports queue instead of running immediately, a full queue is a
+# capacity statement the user can act on, not a transient "try again".
+_URL_QUEUE_FULL_DETAIL = (
+    f"Queue is full ({MAX_PENDING_URL_JOBS} links waiting) - cancel a job or wait"
+)
+_UPLOAD_QUEUE_FULL_DETAIL = (
+    f"Upload queue is full ({MAX_PENDING_UPLOAD_JOBS} waiting) - cancel a job or wait"
+)
 
 
 def _sanitize_title(filename: str) -> str:
@@ -52,7 +81,12 @@ def _probe_duration(path: Path) -> float:
             str(path),
         ],
         capture_output=True,
+        # See the note in pipeline/separate.py: text=True alone decodes with the
+        # Windows locale encoding and a stray byte in ffprobe's output would
+        # fail the upload outright.
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
     )
     if result.returncode != 0:
@@ -78,22 +112,63 @@ def _copy_to_dest(src_file: object, dest: Path) -> None:
         shutil.copyfileobj(src_file, out)  # type: ignore[arg-type]
 
 
-def _rmtree_job(job_id: str) -> None:
+def _rmtree_job(job_id: str) -> bool:
+    """Remove a job's directory. False means files are still on disk.
+
+    The outcome used to be swallowed, so delete_job dropped the registry entry
+    whether or not anything was actually deleted -- and restore() then adopted
+    the surviving directory on the next start, which is how deleted songs came
+    back (#521).
+
+    Retried once: on macOS the common failure is Finder or Spotlight creating
+    a .DS_Store between rmtree's scan and its final rmdir, which leaves
+    "Directory not empty" on a directory that is about to be empty again."""
     job_dir = JOBS_DIR / job_id
-    if not job_dir.is_dir():
-        return
-    try:
-        shutil.rmtree(job_dir)
-    except Exception:
-        logger.warning("failed to remove job dir %s", job_dir, exc_info=True)
+    for attempt in (1, 2):
+        if not job_dir.is_dir():
+            return True
+        try:
+            shutil.rmtree(job_dir)
+            return True
+        except Exception:
+            logger.warning(
+                "failed to remove job dir %s (attempt %d)", job_dir, attempt, exc_info=True
+            )
+    return not job_dir.is_dir()
 
 
-def _task_error_cb(task: asyncio.Task) -> None:
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        logger.error("pipeline task raised unhandled exception", exc_info=exc)
+def _job_files_missing(job: Job) -> bool:
+    """True when a "done" job's stem files are gone from disk: the folder was
+    deleted or moved outside the app, not just an in-flight relocation (#354),
+    which is a known, temporary absence and must not flap the library."""
+    if is_relocating():
+        return False
+    stems_dir = (JOBS_DIR / job.id / "stems").resolve()
+    if not stems_dir.is_relative_to(JOBS_DIR.resolve()):
+        return True
+    return not stems_dir.is_dir() or not any(stems_dir.iterdir())
+
+
+def _job_state(job: Job) -> dict:
+    """job.to_state() with "done" downgraded to "unavailable" when the stem
+    files are missing from disk - ground truth for the client, replacing the
+    old approach of the frontend guessing from a 404 or a disappearance from
+    the job list, neither of which caught a job whose registry entry survived
+    but whose stems folder did not."""
+    if job.source_format is None and (job.source_url or "").startswith("local:"):
+        # Uploads made before the format was recorded still have it on disk:
+        # the kept source is source.<ext>, the extension it was validated
+        # against. Kept on the job once found, so the disk is asked once per
+        # job rather than on every state, and persisted with it next time.
+        # Uploads finished before sources were kept have nothing to find and
+        # stay None, which the client shows as the plain note.
+        source = _retained_source(job.id)
+        if source is not None:
+            job.source_format = source.suffix.lower().removeprefix(".")
+    state = job.to_state()
+    if job.status == "done" and _job_files_missing(job):
+        state["status"] = "unavailable"
+    return state
 
 
 class JobRequest(BaseModel):
@@ -110,6 +185,13 @@ class JobRequest(BaseModel):
 async def create_job(request: Request) -> dict[str, str]:
     """Submit a YouTube URL (JSON body) or upload an audio file (multipart/form-data)
     to start a stem-separation job. Returns the new job ID."""
+    if is_relocating():
+        # The stems folder just moved. This process still writes to the old one,
+        # so anything accepted now would be orphaned by the restart.
+        raise HTTPException(
+            status_code=409,
+            detail="Restart StemDeck to finish moving your stems folder before importing",
+        )
     ct = request.headers.get("content-type", "")
     if "multipart/form-data" in ct:
         return await _create_local_job(request)
@@ -135,19 +217,29 @@ async def _create_youtube_job(request: Request) -> dict[str, str]:
     if not selected:
         selected = list(STEM_NAMES)
 
-    job = Job(id=uuid.uuid4().hex[:12], selected_stems=selected, source_url=url)
-    if not registry_register_if_capacity(job, MAX_PENDING_JOBS):
-        raise HTTPException(status_code=503, detail="Server busy, please try again later")
-    task = asyncio.create_task(run_pipeline(job, url, JOBS_DIR))
-    task.add_done_callback(_task_error_cb)
+    job = Job(
+        id=uuid.uuid4().hex[:12],
+        selected_stems=selected,
+        source_url=url,
+        # Captured now, not when the sections stage is reached: that is the
+        # last thing the pipeline does, and the toggle clears itself as soon
+        # as the user opens another song.
+        auto_sections=get_auto_sections(),
+    )
+    if not registry_register_if_capacity(job, MAX_PENDING_URL_JOBS):
+        raise HTTPException(status_code=503, detail=_URL_QUEUE_FULL_DETAIL)
+    jobqueue.enqueue(job.id)
+    registry_persist(JOBS_DIR)
     return {"job_id": job.id}
 
 
 async def _create_local_job(request: Request) -> dict[str, str]:
     # Fast pre-check: if already at capacity, reject before touching disk.
     # The real atomic check happens in register_if_capacity after the upload.
-    if sum(1 for j in registry_all_jobs().values() if j.status == "queued") >= MAX_PENDING_JOBS:
-        raise HTTPException(status_code=503, detail="Server busy, please try again later")
+    # Only other uploads count here: a queue full of links costs no disk and
+    # must not block a file import.
+    if registry_pending_count(uploads=True) >= MAX_PENDING_UPLOAD_JOBS:
+        raise HTTPException(status_code=503, detail=_UPLOAD_QUEUE_FULL_DETAIL)
 
     # Quick pre-check on Content-Length to fail fast for obviously oversized
     # uploads without buffering the whole body first.
@@ -171,7 +263,7 @@ async def _create_local_job(request: Request) -> dict[str, str]:
     if ext not in _ALLOWED_EXTS:
         raise HTTPException(
             status_code=422,
-            detail=f"Unsupported file type '{ext}': accepted formats are .mp3, .wav, .flac, .mp4, and .m4a",
+            detail=f"Unsupported file type '{ext}': accepted formats are .mp3, .wav, .flac, .mp4, .m4a, .ogg, and .opus",
         )
 
     # Validate stems list from form field
@@ -225,23 +317,57 @@ async def _create_local_job(request: Request) -> dict[str, str]:
         title=title,
         duration_sec=duration,
         source_url=local_source_url,
+        source_format=ext.removeprefix("."),
+        auto_sections=get_auto_sections(),
     )
-    if not registry_register_if_capacity(job, MAX_PENDING_JOBS):
+    if not registry_register_if_capacity(job, MAX_PENDING_UPLOAD_JOBS):
         shutil.rmtree(job_dir, ignore_errors=True)
-        raise HTTPException(status_code=503, detail="Server busy, please try again later")
-    task = asyncio.create_task(run_local_pipeline(job, source_path, JOBS_DIR))
-    task.add_done_callback(_task_error_cb)
+        raise HTTPException(status_code=503, detail=_UPLOAD_QUEUE_FULL_DETAIL)
+    jobqueue.enqueue(job.id)
+    registry_persist(JOBS_DIR)
     return {"job_id": job.id}
 
 
 @router.get("")
-def list_jobs() -> list[dict]:
-    """List all completed jobs in the library, sorted by creation time."""
+def list_jobs(trashed: Literal["exclude", "include", "only"] = "exclude") -> list[dict]:
+    """Completed jobs in the library, oldest first.
+
+    Trashed jobs are left out by default, which is the whole point of the
+    parameter: this endpoint is the phone UI's entire library, and before the
+    Trash moved server-side it happily listed tracks the user had deleted on
+    their desktop hours earlier.
+    """
+    jobs = sorted(registry_all_jobs().values(), key=lambda j: j.created_at)
     return [
-        job.to_state()
-        for job in sorted(registry_all_jobs().values(), key=lambda j: j.created_at)
+        _job_state(job)
+        for job in jobs
         if job.status == "done"
+        and (trashed == "include" or (job.trashed_at is not None) == (trashed == "only"))
     ]
+
+
+@router.post("/{job_id}/trash")
+def trash_job(job_id: str) -> dict:
+    """Put a job in the Trash. Reversible, and nothing on disk is touched."""
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    job = registry_set_trashed(job_id, True)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    registry_persist(JOBS_DIR)
+    return {"job_id": job.id, "trashed_at": job.trashed_at}
+
+
+@router.post("/{job_id}/restore")
+def restore_job(job_id: str) -> dict:
+    """Take a job back out of the Trash."""
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    job = registry_set_trashed(job_id, False)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    registry_persist(JOBS_DIR)
+    return {"job_id": job.id, "trashed_at": job.trashed_at}
 
 
 @router.get("/{job_id}")
@@ -250,7 +376,7 @@ def get_job(job_id: str) -> dict:
     job = registry_get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
-    return job.to_state()
+    return _job_state(job)
 
 
 @router.post("/{job_id}/cancel")
@@ -260,16 +386,245 @@ def cancel_job(job_id: str) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     if job.status in ("done", "error", "cancelled"):
+        # A vocal split only ever runs on a done job, so this early return made
+        # it uncancellable by construction: the flag was never even set, while
+        # the split held _pipeline_lock and stalled the whole import queue for
+        # its full duration (#519). Terminating the worker is enough -- the
+        # split's own error path marks it failed and releases the lock.
+        if job.vocal_split == "running":
+            job.cancel_requested = True
+            proc = registry_get_proc(job_id)
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
         return job.to_state()
     job.cancel_requested = True
-    proc = registry_get_proc(job_id)
-    if proc is not None and proc.poll() is None:
-        proc.terminate()
+
+    # Still waiting: the worker will never pick it up, so finalise it here.
+    # Previously a queued job only honoured cancel once its turn arrived, kept
+    # occupying a capacity slot until then, and a queued upload held its source
+    # file (up to 400 MB) for the whole wait.
+    if jobqueue.discard(job_id):
+        _set(job, status="cancelled", stage="Cancelled")
+        jobqueue.cleanup_job_dir(job_id)
+        registry_persist(JOBS_DIR)
+        return job.to_state()
+
+    # Only the running job owns the shared demucs worker. Terminating on any
+    # other id would kill someone else's separation if a stale set_proc entry
+    # ever survived -- cheap insurance now that many job ids are live at once.
+    if job_id == jobqueue.running_id():
+        proc = registry_get_proc(job_id)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
     return job.to_state()
+
+
+def _write_vocal_split_error(stems_dir: Path, cause: str, tail: list[str]) -> None:
+    """Best-effort error record for the on-demand vocal split (#275). The job
+    itself stays "done" -- this is diagnostic-only, not the quarantine path
+    (which would delete the job's base stems)."""
+    try:
+        lines = [f"cause: {cause}", "", "--- stderr tail ---", *tail]
+        (stems_dir / "vocal_split_error.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        logger.warning("could not write vocal_split_error.txt in %s", stems_dir, exc_info=True)
+
+
+class ResplitBody(BaseModel):
+    """Which stems the new run should mix down to. Same shape the importer
+    takes, and bounded the same way: unknown names are dropped rather than
+    trusted, and an empty result falls back to every stem."""
+
+    stems: list[str] = Field(default_factory=list, max_length=len(STEM_NAMES))
+
+
+def _retained_source(job_id: str) -> Path | None:
+    """The upload kept beside a finished job, if there is one.
+
+    Only uploads have this. A link's source is deleted once its stems exist,
+    because it can be fetched again; an upload's cannot, so the runner keeps
+    it (see cleanup_source). Jobs finished before that change kept nothing,
+    which is why absence is an ordinary answer here rather than an error.
+    """
+    job_dir = (JOBS_DIR / job_id).resolve()
+    if not job_dir.is_dir() or not job_dir.is_relative_to(JOBS_DIR.resolve()):
+        return None
+    for candidate in sorted(job_dir.glob("source.*")):
+        resolved = candidate.resolve()
+        if (
+            resolved.is_file()
+            and resolved.suffix.lower() in _ALLOWED_EXTS
+            and resolved.is_relative_to(JOBS_DIR.resolve())
+        ):
+            return resolved
+    return None
+
+
+def _resplit_source_url(source_url: str | None, new_id: str) -> str:
+    """A source that names the same file without colliding with it.
+
+    The library replaces any existing track that shares a sourceUrl -- that is
+    how re-importing a link supersedes its old entry -- so a re-split reusing
+    the original's source deleted the very track it came from. Worse than
+    losing the row: the job directory stayed on disk with nothing referencing
+    it, and syncWithServer re-adopted it on the next launch as a duplicate.
+
+    Reusing the row is not an option either. Two jobs that share a source are
+    collapsed again on every launch, so the pair has to differ on disk, not
+    just in this session.
+
+    The marker goes on the end. It once went before the last dot, to keep an
+    extension that the client read the format from, but an upload's title has
+    no extension (#690): the dot it found was in the title, so "Mr. Brightside"
+    became "Mr (abc123). Brightside". The format is source_format now.
+    """
+    return f"{source_url or 'local:track'} ({new_id[:6]})"
+
+
+def _link_or_copy(src: Path, dest: Path) -> None:
+    """Hard-link the source into the new job, copying only if that fails.
+
+    A re-split of a 300 MB upload should not cost another 300 MB. Both paths
+    are inside JOBS_DIR so a link is normally available; os.link raises
+    EXDEV across filesystems and EPERM on some mounts, and a copy is correct
+    in every case, just larger.
+    """
+    try:
+        os.link(src, dest)
+    except OSError:
+        shutil.copy2(src, dest)
+
+
+@router.post("/{job_id}/resplit")
+async def resplit_job(job_id: str, body: ResplitBody) -> dict:
+    """Separate a finished upload again, from the source kept beside it.
+
+    A link-sourced track has never needed this: re-importing its URL does the
+    same thing. An upload had no equivalent -- the file was handed over once,
+    and the composer has nothing to submit for it -- so changing which stems
+    you wanted meant finding the original file and uploading it a second time
+    (#635).
+
+    Produces a new job rather than mutating this one, which is exactly what
+    re-importing a link already does. The old track keeps its stems, its
+    sections and its beat grid until the person who asked for this decides
+    otherwise.
+    """
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    job = registry_get(job_id)
+    if job is None or job.status != "done":
+        raise HTTPException(status_code=404, detail="job not found")
+
+    source = _retained_source(job_id)
+    if source is None:
+        # Not a failure of this request: the track simply has nothing to
+        # re-separate from. The UI offers re-import for anything with a URL.
+        raise HTTPException(status_code=409, detail="no source kept for this track")
+
+    selected = [s for s in body.stems if s in STEM_NAMES] or list(STEM_NAMES)
+
+    new_id = uuid.uuid4().hex[:12]
+    new_dir = JOBS_DIR / new_id
+    new_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        await asyncio.to_thread(_link_or_copy, source, new_dir / f"source{source.suffix}")
+    except OSError:
+        shutil.rmtree(new_dir, ignore_errors=True)
+        logger.exception("[%s] resplit could not stage the source", job_id)
+        raise HTTPException(status_code=500, detail="could not start re-split") from None
+
+    new_job = Job(
+        id=new_id,
+        selected_stems=selected,
+        title=job.title,
+        duration_sec=job.duration_sec,
+        # Still a local: source, so this job keeps its own copy and can be
+        # re-split in turn -- but distinct, so the library shows it beside the
+        # track it came from instead of replacing it.
+        source_url=_resplit_source_url(job.source_url, new_id),
+        source_format=source.suffix.lower().removeprefix("."),
+        auto_sections=get_auto_sections(),
+    )
+    if not registry_register_if_capacity(new_job, MAX_PENDING_UPLOAD_JOBS):
+        shutil.rmtree(new_dir, ignore_errors=True)
+        raise HTTPException(status_code=503, detail=_UPLOAD_QUEUE_FULL_DETAIL)
+    jobqueue.enqueue(new_job.id)
+    registry_persist(JOBS_DIR)
+    # source_url comes back because the client cannot derive it: it is
+    # deliberately not the one it asked with, and the library keys its
+    # dedup on exactly this string.
+    return {"job_id": new_job.id, "source_url": new_job.source_url}
+
+
+@router.post("/{job_id}/vocal-split")
+async def start_vocal_split(job_id: str) -> Response:
+    """Trigger the on-demand lead/backing vocal split (#275) for a completed
+    job: a second model pass over the existing vocals.wav, producing
+    lead_vocals.wav + backing_vocals.wav. Idempotent once done -- calling
+    again returns 202 with the existing result rather than re-running the
+    (expensive) model."""
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    job = registry_get(job_id)
+    if job is None or job.status != "done":
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.vocal_split == "running":
+        raise HTTPException(status_code=409, detail="vocal split already running")
+    if job.vocal_split == "done":
+        return JSONResponse(_job_state(job), status_code=202)
+
+    stems_dir = (JOBS_DIR / job_id / "stems").resolve()
+    if not stems_dir.is_relative_to(JOBS_DIR.resolve()):
+        raise HTTPException(status_code=404, detail="job not found")
+
+    job.vocal_split = "running"
+    _set(job, stage="Splitting lead/backing vocals...")
+    try:
+        async with _pipeline_lock:
+            new_names = await asyncio.to_thread(split_vocals, job, stems_dir)
+    except Exception as e:
+        cause = classify_failure("\n".join([*(getattr(e, "tail", None) or []), str(e)]))
+        logger.warning("[%s] vocal split failed: %s", job_id, e, exc_info=True)
+        _write_vocal_split_error(stems_dir, cause, getattr(e, "tail", None) or [str(e)])
+        job.vocal_split = "error"
+        _set(job, stage="Done")
+        registry_persist(JOBS_DIR)
+        raise HTTPException(status_code=500, detail="vocal split failed") from e
+
+    existing = {s["name"] for s in job.stems}
+    for name in new_names:
+        if name not in existing:
+            job.stems.append({"name": name, "url": f"/api/jobs/{job_id}/stems/{name}.wav"})
+    # "vocals" rides along so presence_for_split can recover the scale the base
+    # stems were normalised against; without it the two new cards would have no
+    # percentage to show.
+    rms_values = merge_stem_peaks(stems_dir, ["vocals", *new_names])
+    extra_presence = presence_for_split(rms_values, job.stem_presence)
+    if extra_presence:
+        job.stem_presence = {**(job.stem_presence or {}), **extra_presence}
+    job.vocal_split = "done"
+    _set(job, stage="Done")
+    registry_persist(JOBS_DIR)
+    return JSONResponse(_job_state(job))
 
 
 _SECTION_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
+_SECTIONS_WRITE_LOCK = threading.Lock()
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    """Durably replace a JSON file without exposing a partial write."""
+    temp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        with temp.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(data, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 class SectionItem(BaseModel):
@@ -278,6 +633,16 @@ class SectionItem(BaseModel):
     start: float
     end: float
     color: str
+    kind: (
+        Literal["intro", "outro", "break", "bridge", "inst", "solo", "verse", "chorus", "part"]
+        | None
+    ) = None
+    # Pins a section against drag and resize in the timeline editor (#573).
+    # It must be declared here to exist at all: this model takes Pydantic's
+    # default extra="ignore", so an undeclared field sent by the editor is
+    # dropped on save and answered 200, and the flag comes back false on the
+    # next load with nothing anywhere saying why.
+    locked: bool = False
 
     @field_validator("id")
     @classmethod
@@ -306,8 +671,18 @@ class SectionItem(BaseModel):
         return round(v, 3)
 
 
+# Upper bound on a section list. normalize_sections and the timeline editor
+# both refuse a section shorter than 0.5 s, so the longest track StemDeck
+# accepts (3600 s) cannot legitimately carry more than 7200 of them; 10000
+# leaves headroom while refusing a payload sent to stall the event loop.
+# Without a bound here a 33 MB body held every other request for ~4 seconds,
+# and needed no valid job to do it: the body is parsed before the handler runs
+# and answers 404 (#481).
+_MAX_SECTIONS = 10000
+
+
 class SectionsBody(BaseModel):
-    sections: list[SectionItem]
+    sections: list[SectionItem] = Field(max_length=_MAX_SECTIONS)
 
 
 @router.patch("/{job_id}/sections")
@@ -319,30 +694,262 @@ def update_sections(job_id: str, body: SectionsBody) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
 
-    validated = [s.model_dump() for s in body.sections]
-    job.sections = validated
+    validated = [s.model_dump(exclude_none=True) for s in body.sections]
 
     job_dir = (JOBS_DIR / job_id).resolve()
     if not job_dir.is_relative_to(JOBS_DIR.resolve()):
         raise HTTPException(status_code=404, detail="job not found")
     meta_path = job_dir / "metadata.json"
 
-    meta: dict = {}
-    if meta_path.is_file():
+    with _SECTIONS_WRITE_LOCK:
+        meta: dict = {}
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            pass
-    meta["sections"] = validated
+            if meta_path.is_file():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["sections"] = validated
+            meta["sections_source"] = "manual"
+            _write_json_atomic(meta_path, meta)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.exception("failed to write sections for %s: %s", job_id, exc)
+            raise HTTPException(status_code=500, detail="failed to save sections") from exc
+
+        _set(job, sections=validated, sections_source="manual")
+        registry_persist(JOBS_DIR)
+
+    return {"job_id": job_id, "sections": validated, "sections_source": "manual"}
+
+
+# Upper bound on an edited grid. A 20-minute track at 300 BPM is ~6000 beats;
+# 20000 leaves generous headroom while refusing a payload crafted to exhaust
+# memory or disk.
+_MAX_EDITED_BEATS = 20000
+_MAX_BARS = 2000
+
+
+class BarMark(BaseModel):
+    """A downbeat and the bar length that runs from it until the next mark."""
+
+    beat: int = Field(ge=0, lt=_MAX_EDITED_BEATS)
+    beats_per_bar: int = Field(ge=1, le=32)
+
+
+class BeatsBody(BaseModel):
+    beats: list[float] = Field(max_length=_MAX_EDITED_BEATS)
+    bars: list[BarMark] = Field(default_factory=list, max_length=_MAX_BARS)
+
+    @field_validator("beats")
+    @classmethod
+    def _check_beats(cls, v: list[float]) -> list[float]:
+        # The client scheduler binary-searches this array and assumes it is
+        # sorted and strictly increasing; enforce that at the boundary rather
+        # than trusting the editor to have maintained it.
+        out: list[float] = []
+        for t in v:
+            if not math.isfinite(t) or not (0 <= t < 86400):
+                raise ValueError("beat time out of range")
+            r = round(float(t), 6)
+            if out and r <= out[-1]:
+                raise ValueError("beat times must be strictly increasing")
+            out.append(r)
+        return out
+
+
+def _beats_paths(job_id: str) -> tuple[Path, Path]:
+    """(computed, user-edited) grid paths, both verified inside JOBS_DIR."""
+    stems = (JOBS_DIR / job_id / "stems").resolve()
+    if not stems.is_relative_to(JOBS_DIR.resolve()):
+        raise HTTPException(status_code=404, detail="job not found")
+    return stems / "beats.json", stems / "beats.user.json"
+
+
+# Keys of error.txt that may be handed to the client. `title` and `source` are
+# deliberately absent: this feeds a "report it on GitHub" flow whose issues are
+# public, and the user adds what they were working on if they want to. The
+# server is the right place to enforce that -- not the client that builds the
+# report body.
+_FAILURE_PUBLIC_KEYS = frozenset(
+    ("time", "stage", "device", "model", "cause", "timings", "exception")
+)
+
+
+@router.get("/{job_id}/failure")
+def get_failure(job_id: str) -> dict:
+    """Return the quarantined failure evidence for a job that errored.
+
+    _quarantine_failed_job writes jobs/failed/<id>/error.txt on every pipeline
+    failure (#277) and until now nothing ever read it back: the UI had only the
+    one-line `error_detail`, so a bug report could not carry the stderr tail or
+    the full traceback that say *why* demucs died. Read-only, and never serves
+    the whole file -- only the technical keys above, plus the tail and
+    traceback (both already home-directory-redacted by the writer).
+    """
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+
+    # JOB_ID_RE rejects "failed", so the quarantine dir can never be addressed
+    # as a job id; join it explicitly and re-verify the result stays inside.
+    failed_dir = (JOBS_DIR / "failed" / job_id).resolve()
+    if not failed_dir.is_relative_to((JOBS_DIR / "failed").resolve()):
+        raise HTTPException(status_code=404, detail="job not found")
+    path = failed_dir / "error.txt"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no failure evidence for this job")
+
     try:
-        meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
-        logger.exception("failed to write sections for %s: %s", job_id, exc)
-        raise HTTPException(status_code=500, detail="failed to save sections") from exc
+        logger.exception("unreadable failure evidence for %s", job_id)
+        raise HTTPException(status_code=404, detail="no failure evidence for this job") from exc
 
-    registry_persist(JOBS_DIR)
+    fields: dict[str, str] = {}
+    tail: list[str] = []
+    tb: list[str] = []
+    section = "fields"
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "--- stderr tail ---":
+            section = "tail"
+            continue
+        if stripped == "--- traceback ---":
+            # The writer separates sections with a blank line for readability
+            # in the raw file; drop it here rather than let it show up as a
+            # trailing empty entry in `tail`.
+            if tail and tail[-1] == "":
+                tail.pop()
+            section = "traceback"
+            continue
+        if section == "tail":
+            tail.append(line)
+            continue
+        if section == "traceback":
+            tb.append(line)
+            continue
+        key, sep, value = line.partition(":")
+        if sep and key in _FAILURE_PUBLIC_KEYS:
+            fields[key] = value.strip()
 
-    return {"job_id": job_id, "sections": validated}
+    return {"job_id": job_id, **fields, "tail": tail, "traceback": tb}
+
+
+@router.get("/{job_id}/beats")
+def get_beats(job_id: str) -> Response:
+    """Return the beat grid, preferring the user's edits over the detected one.
+
+    Deliberately separate from the immutable `stems/beats.json`: that file is
+    a computed artifact and is cached forever, while this response changes
+    whenever the user edits and must never be cached.
+    """
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    job = registry_get(job_id)
+    if job is None or job.status != "done":
+        raise HTTPException(status_code=404, detail="job not ready")
+
+    computed_path, user_path = _beats_paths(job_id)
+    if not computed_path.is_file():
+        raise HTTPException(status_code=404, detail="beat grid not found")
+    try:
+        grid = json.loads(computed_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.exception("unreadable beat grid for %s", job_id)
+        raise HTTPException(status_code=404, detail="beat grid not found") from exc
+
+    # User edits override the detected beats but keep the computed onsets,
+    # which the editor still needs for snapping and which editing never changes.
+    if user_path.is_file():
+        try:
+            edits = json.loads(user_path.read_text(encoding="utf-8"))
+            if isinstance(edits.get("beats"), list) and edits["beats"]:
+                grid["beats"] = edits["beats"]
+                grid["bars"] = edits.get("bars") or []
+                grid["edited"] = True
+        except (OSError, json.JSONDecodeError):
+            logger.warning("ignoring unreadable beat edits for %s", job_id)
+
+    grid.setdefault("bars", [])
+    grid.setdefault("edited", False)
+    return JSONResponse(grid, headers={"Cache-Control": "no-store"})
+
+
+def _reject_non_finite(_token: str) -> float:
+    """`json.loads` parse_constant hook.
+
+    Python's JSON parser accepts the non-standard `NaN`, `Infinity` and
+    `-Infinity` literals. Letting them reach Pydantic produces a validation
+    error whose `input` field holds the non-finite float, and FastAPI then
+    cannot serialise its own 422 -- the request fails with a 500 and a
+    traceback instead of a clean rejection. Refusing them at parse time keeps
+    the error a plain string.
+    """
+    raise ValueError("non-finite numbers are not accepted")
+
+
+async def _parse_beats_body(request: Request) -> BeatsBody:
+    """Parse and validate a beats payload, rejecting non-finite floats first."""
+    try:
+        raw = await request.body()
+        data = json.loads(raw, parse_constant=_reject_non_finite)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="invalid JSON body") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=422, detail="expected a JSON object")
+    try:
+        return BeatsBody(**data)
+    except Exception as exc:
+        # Message only -- never echo the submitted values back.
+        raise HTTPException(status_code=422, detail="invalid beat grid") from exc
+
+
+@router.patch("/{job_id}/beats")
+async def update_beats(job_id: str, request: Request) -> dict:
+    """Persist an edited beat grid.
+
+    Written to a separate file from the detected grid so re-running analysis
+    can never silently discard a user's corrections.
+    """
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    body = await _parse_beats_body(request)
+    job = registry_get(job_id)
+    if job is None or job.status != "done":
+        raise HTTPException(status_code=404, detail="job not ready")
+
+    computed_path, user_path = _beats_paths(job_id)
+    if not computed_path.is_file():
+        raise HTTPException(status_code=404, detail="beat grid not found")
+
+    payload = {
+        "version": 1,
+        "beats": body.beats,
+        "bars": [b.model_dump() for b in body.bars],
+    }
+    try:
+        tmp = user_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(user_path)
+    except OSError as exc:
+        logger.exception("failed to write beat edits for %s", job_id)
+        raise HTTPException(status_code=500, detail="failed to save beat grid") from exc
+
+    return {"job_id": job_id, "beats": len(payload["beats"]), "edited": True}
+
+
+@router.delete("/{job_id}/beats")
+def reset_beats(job_id: str) -> dict:
+    """Discard user edits and fall back to the detected grid."""
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    job = registry_get(job_id)
+    if job is None or job.status != "done":
+        raise HTTPException(status_code=404, detail="job not ready")
+
+    _, user_path = _beats_paths(job_id)
+    try:
+        user_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.exception("failed to reset beat edits for %s", job_id)
+        raise HTTPException(status_code=500, detail="failed to reset beat grid") from exc
+    return {"job_id": job_id, "edited": False}
 
 
 @router.delete("/{job_id}")
@@ -355,7 +962,16 @@ def delete_job(job_id: str) -> dict[str, str]:
         raise HTTPException(status_code=404, detail="job not found")
     if job.status not in ("done", "error", "cancelled"):
         raise HTTPException(status_code=409, detail="job is still running")
-    _rmtree_job(job_id)
+    removed = _rmtree_job(job_id)
+    # Recorded whether or not the files went away. The user asked for this job
+    # to be gone; without the record, a directory that outlived the delete is
+    # re-adopted by restore() on the next start and the track reappears.
+    registry_mark_deleted(job_id)
     registry_remove(job_id)
     registry_persist(JOBS_DIR)
+    if not removed:
+        raise HTTPException(
+            status_code=500,
+            detail="Removed from the library, but its files could not be deleted.",
+        )
     return {"job_id": job_id, "status": "deleted"}

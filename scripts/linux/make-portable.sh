@@ -80,6 +80,36 @@ echo "==> Cleaning stage"
 rm -rf "$STAGE" "$ARCHIVE_PATH" "$CHECKSUM_PATH"
 mkdir -p "$STAGE" "$BACKEND_DIR" "$PYTHON_DIR"
 
+# QuickJS, for YouTube's signature/n-challenge solver (#438). yt-dlp ships the
+# solver script (the yt-dlp-ejs dependency) but needs a JavaScript engine to
+# run it, and a portable install has nothing on PATH.
+#
+# quickjs-ng rather than deno: 2.6 MB against deno's ~110 MB, times two
+# bundles, against a 2 GiB release asset cap this project has already hit once
+# (#222, #225).
+#
+# It lives in backend/, not data/. The in-app updater replaces the executable
+# and backend/ and leaves data/ alone, so a binary in data/ would only ever
+# reach a fresh install. Here it arrives through an ordinary update, which is
+# the whole point: shipping this must not cost existing users a reinstall.
+#
+# Pinned by version and SHA256, the same rule as the macOS FFmpeg download
+# (#172). An unverified binary fetched at package time is a supply-chain hole
+# whether or not it is small.
+QJS_VERSION="v0.16.2"
+QJS_SHA256="c5e1b16adfa36def7ac523d6ba54edc77ef66a4dfd65d73e6eae19025f9b7b0a"
+QJS_URL="https://github.com/quickjs-ng/quickjs/releases/download/${QJS_VERSION}/qjs-linux-x86_64"
+QJS_DIR="${BACKEND_DIR}/jsruntime"
+mkdir -p "$QJS_DIR"
+echo "==> Fetching QuickJS ${QJS_VERSION}"
+curl -fsSL --retry 3 -o "${QJS_DIR}/qjs" "$QJS_URL"
+echo "${QJS_SHA256}  ${QJS_DIR}/qjs" | sha256sum -c - >/dev/null || {
+    rm -f "${QJS_DIR}/qjs"
+    echo "QuickJS checksum mismatch" >&2
+    exit 1
+}
+chmod +x "${QJS_DIR}/qjs"
+
 # Copy the entire PBS install into python/ (-a preserves symlinks/permissions).
 echo "==> Bundling Python runtime from ${PBS_BASE_PREFIX}"
 cp -a "$PBS_BASE_PREFIX/." "$PYTHON_DIR/"
@@ -135,7 +165,10 @@ echo "    removing:$orphans"
 "$BUNDLED_PYTHON" -m pip uninstall -y $orphans 2>/dev/null || true
 
 echo "==> Verifying imports"
-"$BUNDLED_PYTHON" -c "import fastapi, uvicorn, yt_dlp, demucs, torch, torchaudio, librosa, pyloudnorm, soundfile; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+# audio_separator/onnxruntime: vocal split (#275). Missing here would have
+# caught #407 (librosa 1.0.0 dropping audioread, which audio-separator still
+# needs) before release instead of after.
+"$BUNDLED_PYTHON" -c "import fastapi, uvicorn, yt_dlp, demucs, torch, torchaudio, librosa, pyloudnorm, soundfile, audio_separator, onnxruntime; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
 
 echo "==> Staging backend"
 cp -R "$REPO_ROOT/app" "$BACKEND_DIR/app"
@@ -147,6 +180,22 @@ printf '{ "version": "%s" }\n' "$RESOLVED_VERSION" > "$BACKEND_DIR/static/versio
 
 cp "$REPO_ROOT/packaging/linux/README-LINUX.txt" "$STAGE/README-LINUX.txt"
 cp "$REPO_ROOT/packaging/linux/THIRD_PARTY_NOTICES.txt" "$STAGE/THIRD_PARTY_NOTICES.txt"
+
+# Desktop-entry assets for the optional installer (#360). Carried inside the
+# package so the installer needs no second download and no asset URL that could
+# drift from the release it is installing. The Tauri icon is already square, so
+# it doubles as the desktop icon with no separate artwork to keep in sync.
+echo "==> Staging desktop-entry assets"
+mkdir -p "$STAGE/packaging"
+cp "$REPO_ROOT/desktop/src-tauri/icons/icon.png" "$STAGE/packaging/stemdeck.png"
+cp "$REPO_ROOT/packaging/linux/stemdeck.desktop.in" "$STAGE/packaging/stemdeck.desktop.in"
+
+# The optional installer (#361). It installs the package it sits in, so it needs
+# no network access and cannot disagree with the build about which version it is
+# installing: it reads that from backend/static/version.json above, and the
+# variant from the cpu-only marker below.
+cp "$REPO_ROOT/packaging/linux/install.sh" "$STAGE/install.sh"
+chmod +x "$STAGE/install.sh"
 
 # CPU-only marker: read by is_cpu_only_package so the shell skips GPU detection.
 # Omitted for the NVIDIA variant so the shell detects the GPU and uses CUDA.
@@ -163,6 +212,67 @@ for rel in include test share/cmake; do
 done
 # Static link archives are only needed to build C++ extensions, never to run.
 find "$TORCH_LIB" -name "*.a" -type f -delete 2>/dev/null || true
+
+# The stdlib's own test suite and every package's bundled test/tests directory
+# are never imported at runtime -- on Windows this accounted for ~2,000 files
+# and 33 MB (#421). Mirrored here so both platforms ship the same shape.
+rm -rf "${PYTHON_DIR}/lib/python${PYTHON_VERSION}/test" 2>/dev/null || true
+for d in "${PYTHON_DIR}/lib/python${PYTHON_VERSION}/site-packages"/*/; do
+  for name in test tests; do
+    rm -rf "${d}${name}" 2>/dev/null || true
+  done
+done
+# NOTE: do NOT strip .dist-info RECORD files. pip needs them to replace a
+# package, and the NVIDIA variant pip-installs CUDA torch into this very tree on
+# the user's first run (install_cuda_torch).
+
+# yt-dlp ships ~940 site extractors. StemDeck rejects every host but YouTube
+# and SoundCloud before yt-dlp is called, so the rest are unreachable -- and
+# several dozen of them are adult sites, named as such, plus a 15,000-line
+# lazy_extractors.py listing every one of those domains. None of that belongs
+# on a user's disk. The script verifies itself: it re-imports the pruned tree
+# and asserts YouTube and SoundCloud still match, because the import check
+# below would not catch a broken registry -- extractors resolve lazily through
+# __getattr__, so `import yt_dlp` succeeds even when none of them load.
+"$BUNDLED_PYTHON" "${REPO_ROOT}/scripts/prune_ytdlp_extractors.py" \
+  "${PYTHON_DIR}/lib/python${PYTHON_VERSION}/site-packages"
+
+# Re-verify after the widened strip: the check above ran before it and would not
+# catch a strip that removed something load-bearing (#407, #421).
+"$BUNDLED_PYTHON" -c "import fastapi, uvicorn, yt_dlp, demucs, torch, torchaudio, librosa, pyloudnorm, soundfile, audio_separator, onnxruntime; print('Post-strip import check OK')"
+
+# Full license texts for everything in the venv, generated from the venv rather
+# than maintained by hand. MIT, BSD and Apache-2.0 all require the copyright
+# notice and the license itself to travel with a binary; a name and the word
+# "MIT" in THIRD_PARTY_NOTICES.txt is not that. Runs here, after the strip, so
+# the inventory describes what actually ships.
+"$BUNDLED_PYTHON" "${REPO_ROOT}/scripts/collect_licenses.py" \
+  "${PYTHON_DIR}/lib/python${PYTHON_VERSION}/site-packages" \
+  "${STAGE}/licenses"
+
+# Runtime fingerprint, shipped inside python/ in every package (#421).
+#
+# The in-app updater's SAFETY GATE, not a download trigger: it replaces
+# StemDeck + backend/ only and never touches python/, so an app-only update is
+# safe exactly when the release needs the same Python dependencies already
+# installed. Derived from uv.lock plus the interpreter's major.minor -- the same
+# formula make-portable.ps1 uses, deliberately not the package version, which
+# changes every release and would make every update look incompatible.
+# tr -d '\r': hash the CONTENT with newlines normalised, not the bytes on
+# disk, so a Windows checkout (CRLF) and a Linux one (LF) agree on the id for
+# an identical lockfile. See the matching note in make-portable.ps1.
+RUNTIME_ID="py${PYTHON_VERSION}-$(tr -d '\r' < "${REPO_ROOT}/uv.lock" | sha256sum | cut -c1-16)"
+printf '{"runtimeId":"%s"}\n' "$RUNTIME_ID" > "${PYTHON_DIR}/runtime-version.json"
+echo "==> Runtime id: ${RUNTIME_ID}"
+
+# Importing above rewrote __pycache__ for everything it touched; on Windows that
+# measured 1,912 files / 39 MB and cancelled out most of the strip. Drop it once
+# here, after the last time this script runs the packaged interpreter.
+find "$PYTHON_DIR" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
+find "$PYTHON_DIR" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete 2>/dev/null || true
+# A developer's local __pycache__ rides along in the cp -R above, and it is dead
+# weight in the small update asset that exists precisely to stay small.
+find "$BACKEND_DIR" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
 
 echo "==> Building Tauri desktop binary"
 if [[ "$SKIP_TAURI_BUILD" != "1" ]]; then
@@ -186,6 +296,30 @@ chmod +x "$STAGE/StemDeck"
 echo "==> Creating archive"
 tar -czf "$ARCHIVE_PATH" -C "${REPO_ROOT}/${OUTPUT_ROOT}" "$PACKAGE_NAME"
 ( cd "${REPO_ROOT}/${OUTPUT_ROOT}" && sha256sum "${PACKAGE_NAME}.tar.gz" > "${PACKAGE_NAME}.tar.gz.sha256" )
+
+# Slim "app layer" asset for the in-app updater (#421). The full archive above
+# is untouched and stays the only thing a fresh install needs; this is an extra,
+# much smaller asset used only by an already-installed app updating itself, so
+# it never re-extracts the whole Python runtime for a release that only changed
+# app code.
+#
+# StemDeck and backend/ are identical between the CPU and NVIDIA variants -- the
+# only per-variant difference in the package is the `cpu-only` marker at the
+# root, which the updater never touches -- so this is built once, from whichever
+# invocation sets PUBLISH_UPDATER_ASSETS=1, and needs no variant suffix.
+#
+# tar rather than zip so the executable bit on StemDeck survives; a zip would
+# land it without +x and the relaunch after an update would fail.
+if [[ "${PUBLISH_UPDATER_ASSETS:-0}" == "1" ]]; then
+  echo "==> Creating updater app-layer asset"
+  UPDATER_APP_NAME="StemDeck-Linux-x64-app"
+  ( cd "$STAGE" && tar -czf "${REPO_ROOT}/${OUTPUT_ROOT}/${UPDATER_APP_NAME}.tar.gz" StemDeck backend )
+  ( cd "${REPO_ROOT}/${OUTPUT_ROOT}" \
+      && sha256sum "${UPDATER_APP_NAME}.tar.gz" > "${UPDATER_APP_NAME}.tar.gz.sha256" )
+  cp "${PYTHON_DIR}/runtime-version.json" \
+     "${REPO_ROOT}/${OUTPUT_ROOT}/StemDeck-Linux-x64-runtime-version.json"
+  echo "Updater app pack : ${REPO_ROOT}/${OUTPUT_ROOT}/${UPDATER_APP_NAME}.tar.gz"
+fi
 
 echo "==> Done"
 if [[ "$CPU_ONLY" == "1" ]]; then

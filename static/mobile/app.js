@@ -5,6 +5,8 @@
 // Extract is still mock pending the SSE/upload wiring (next step).
 import { fetchJobs, jobToCard } from "../js/shared/jobs.js";
 import { createChunkedAudioEngine } from "../js/chunkedAudioEngine.js";
+import { PITCH_MAX, PITCH_MIN, clampPitch } from "../js/pitchBus.js";
+import { createPlaybackContext } from "../js/audioContext.js";
 // Per-stem label + color, keyed by the backend stem name. Unknown names fall
 // back to a rotating palette so non-standard models still render sensibly.
 const STEM_META = {
@@ -14,14 +16,21 @@ const STEM_META = {
   guitar: { label: "Guitar", color: "#3fcf6e" },
   piano: { label: "Piano", color: "#9b6cf0" },
   other: { label: "Other", color: "#4a9bf5" },
+  // On-demand lead/backing vocal split (#275) -- not one of the Extract chips
+  // (see vocalSplitMode below), just lane metadata for once a job has one.
+  lead_vocals: { label: "Lead Vocals", color: "#f0506e" },
+  backing_vocals: { label: "Backing Vocals", color: "#c44ad0" },
 };
 const FALLBACK_COLORS = ["#f0506e", "#f5862b", "#f5c518", "#3fcf6e", "#9b6cf0", "#4a9bf5", "#2bd4c4", "#c44ad0"];
 function stemMeta(name, idx) {
   return STEM_META[name] || { label: name.charAt(0).toUpperCase() + name.slice(1), color: FALLBACK_COLORS[idx % FALLBACK_COLORS.length] };
 }
 
-// Stem chips shown on the (still-mock) Extract screen.
-const EXTRACT_STEMS = Object.entries(STEM_META).map(([id, m]) => ({ id, name: m.label, color: m.color }));
+// Stem chips shown on the Extract screen. lead_vocals/backing_vocals aren't
+// separately selectable here -- they're an on-demand refinement of the
+// Vocals chip (see the vocalSplitMode segmented control in extractScreen()).
+const EXTRACT_BASE_STEMS = ["vocals", "drums", "bass", "guitar", "piano", "other"];
+const EXTRACT_STEMS = EXTRACT_BASE_STEMS.map((id) => ({ id, name: STEM_META[id].label, color: STEM_META[id].color }));
 
 const DEFAULT_GRADIENT = "linear-gradient(150deg,#3a3a42,#202026)";
 const FILTERS = ["All", "Favorites"];
@@ -40,7 +49,7 @@ let audioCtx = null;
 function ensureAudioCtx() {
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) return null;
-  if (!audioCtx) audioCtx = new AC();
+  if (!audioCtx) audioCtx = createPlaybackContext(AC);
   if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
   return audioCtx;
 }
@@ -73,6 +82,7 @@ const state = {
   muted: {},
   solo: {},
   speed: 1.0,
+  pitch: 0, // global transpose in semitones, -6..+6
   selected: { vocals: true, drums: true, bass: true, guitar: true, piano: true, other: true },
   quality: "High",
   filter: "All",
@@ -84,7 +94,10 @@ const state = {
   // Extract screen.
   extractUrl: "",
   extractFile: null, // File chosen for upload
-  extractJob: null, // { id, title, status, progress, stage } while a job runs
+  extractJob: null, // { id, title, status, progress, stage, vocalSplitMode } while a job runs
+  // "all" = plain Vocals lane (default); "split" = also run the on-demand
+  // lead/backing split (#275) once the base separation finishes.
+  vocalSplitMode: "all",
 };
 
 let extractES = null; // EventSource for the active extraction
@@ -210,6 +223,7 @@ async function openTrack(card, { autoplay = false } = {}) {
   state.playing = false;
   state.progress = 0;
   state.speed = 1.0;
+  state.pitch = 0;
   render();
 
   if (engine) { engine.destroy(); engine = null; engineTrackId = null; }
@@ -235,8 +249,14 @@ async function openTrack(card, { autoplay = false } = {}) {
   // Use WAV stems with range-request chunking (chunkedAudioEngine.js): fetches
   // 10-second windows at a time, so the first audio starts after ~7 MB instead
   // of the full file, and peak RAM stays around 28 MB regardless of track length.
+  // Once the on-demand lead/backing split (#275) has run, show those two
+  // lanes in place of the plain Vocals lane rather than all three -- they're
+  // a decomposition of the same signal (mirrors the backend's mixdown guard
+  // in app/api/stems.py), not three independent tracks.
+  const stemNames = new Set((detail.stems || []).map((s) => s && s.name));
+  const vocalSplitDone = stemNames.has("lead_vocals") && stemNames.has("backing_vocals");
   const laneList = (detail.stems || [])
-    .filter((s) => s && s.name !== "original" && s.url)
+    .filter((s) => s && s.url && s.name !== "original" && !(vocalSplitDone && s.name === "vocals"))
     .map((s, i) => ({ name: s.name, url: s.url, ...stemMeta(s.name, i) }));
 
   state.vols = {};
@@ -433,6 +453,33 @@ function analysisBody() {
   return `<div class="pad" style="padding-top:16px">${statsHtml}${presenceHtml}${exportBtns}</div>`;
 }
 
+/**
+ * The global transpose row.
+ *
+ * Phones get this UI rather than the desktop one, which is where transpose
+ * lives everywhere else, so without a control here the feature simply does not
+ * exist on a phone however well the engine supports it. There are no per-lane
+ * keys on this screen, so this is the whole of transpose on mobile: every lane
+ * moves together.
+ *
+ * Steppers rather than a slider. A semitone is one twelfth of the range and a
+ * slider that wide is not something a thumb can land on.
+ */
+function keyRow() {
+  const n = state.pitch;
+  const label = n === 0 ? "0" : (n > 0 ? `+${n}` : `${n}`);
+  const off = !engineReady || engine?.supportsPitchShift?.() !== true;
+  const why = off ? ' title="Transpose is not available on this connection"' : "";
+  return `<div class="speed-row key-row"${why}>
+        <span class="speed-row-label">Key</span>
+        <div class="key-steps">
+          <button class="key-step" data-key-step="-1" ${off || n <= PITCH_MIN ? "disabled" : ""}>&minus;</button>
+          <button class="key-step" data-key-step="1" ${off || n >= PITCH_MAX ? "disabled" : ""}>+</button>
+        </div>
+        <span class="speed-row-val${off ? " off" : ""}">${label}</span>
+      </div>`;
+}
+
 function mixerScreen() {
   const c = state.current || { title: "No track selected", sub: "Pick one from your Library", initial: "♪", gradient: DEFAULT_GRADIENT, stemCount: 0 };
   const sourceTag = c.sub || "—";
@@ -473,6 +520,7 @@ function mixerScreen() {
         <input type="range" class="speed-slider" data-speed min="0" max="2" step="0.25" value="${state.speed}">
         <span class="speed-row-val">${state.speed % 1 === 0 ? state.speed.toFixed(1) : state.speed}x</span>
       </div>
+      ${keyRow()}
       ${preparing ? '<div class="mx-prep">Preparing audio…</div>' : ""}
       <div class="segmented">
         <button class="${state.mixerView === "stems" ? "on" : ""}" data-action="mixview" data-view="stems">Stems</button>
@@ -494,15 +542,24 @@ function libraryBody() {
     return `<div class="lib-note">No tracks yet. Head to <b>Extract</b> to split your first song.</div>`;
   }
   return `<div class="eyebrow">RECENT</div>
-    ${state.tracks.map((t) => `<div class="track-wrap${state.swipedTrackId === t.id ? " swiped" : ""}">
+    ${state.tracks.map((t) => {
+      const unavailable = t.status === "unavailable";
+      const canReimport = unavailable && t.sourceUrl && !t.sourceUrl.startsWith("local:");
+      const infoHtml = unavailable
+        ? `<div class="t">${esc(t.title)}</div><div class="s track-warn">${
+          canReimport ? "Track unavailable · tap to reimport" : "Track unavailable · re-upload to restore"
+        }</div>`
+        : `<div class="t">${esc(t.title)}</div><div class="s">${esc(t.sub)}</div><div class="m">${esc(t.meta)}</div>`;
+      return `<div class="track-wrap${state.swipedTrackId === t.id ? " swiped" : ""}">
       <button class="track-delete" data-action="delete" data-id="${esc(t.id)}">Delete</button>
-      <div class="track" data-action="open" data-id="${esc(t.id)}">
+      <div class="track" data-action="${unavailable ? "reimport" : "open"}" data-id="${esc(t.id)}">
         <div class="track-art" style="${artStyle(t)}">${artLabel(t)}</div>
-        <div class="track-info"><div class="t">${esc(t.title)}</div><div class="s">${esc(t.sub)}</div><div class="m">${esc(t.meta)}</div></div>
+        <div class="track-info">${infoHtml}</div>
         <div class="track-dot ${t.status}"></div>
-        <button class="track-load" data-action="open" data-id="${esc(t.id)}">Load</button>
+        <button class="track-load" data-action="${unavailable ? "reimport" : "open"}" data-id="${esc(t.id)}">${unavailable ? "Fix" : "Load"}</button>
       </div>
-    </div>`).join("")}`;
+    </div>`;
+    }).join("")}`;
 }
 
 function libraryScreen() {
@@ -549,13 +606,20 @@ function extractScreen() {
       <div class="sub">Paste a link or upload audio to split into stems.</div>
       <div class="paste">${ICON.link}<input id="ext-url" class="ext-input" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste YouTube or audio URL" value="${esc(state.extractUrl || "")}"></div>
       <button class="upload" data-action="pick-file">${ICON.upload}${fileName ? esc(fileName) : "Upload audio file"}</button>
-      <input id="ext-file" type="file" accept="audio/*,video/mp4,.mp3,.wav,.flac,.m4a,.ogg" style="display:none">
+      <input id="ext-file" type="file" accept="audio/*,video/mp4,.mp3,.wav,.flac,.m4a,.ogg,.opus" style="display:none">
       <div class="eyebrow">STEMS TO EXTRACT</div>
       <div class="chips">${EXTRACT_STEMS.map((s) => {
         const on = !!state.selected[s.id];
         const onStyle = on ? `border-color:${s.color};background:${s.color}1c;` : "";
         return `<button class="chip-btn ${on ? "on" : ""}" style="${onStyle}" data-action="chip" data-id="${s.id}"><div class="dot" style="background:${s.color}"></div><span class="nm">${s.name}</span>${on ? ICON.check : ""}</button>`;
       }).join("")}</div>
+      <div class="vocal-mode-row">
+        <span class="vocal-mode-label">Vocals</span>
+        <div class="segmented sm">
+          <button class="${state.selected.vocals && state.vocalSplitMode !== "split" ? "on" : ""}" data-action="vocalmode" data-mode="all">Combined</button>
+          <button class="${state.selected.vocals && state.vocalSplitMode === "split" ? "on" : ""}" data-action="vocalmode" data-mode="split">Lead + Backing</button>
+        </div>
+      </div>
       <button class="cta" style="margin-top:22px" data-action="split">${ICON.scissors}Split stems</button>
       ${extractProgressCard()}
     </div>
@@ -582,7 +646,8 @@ async function startExtraction() {
     title = url;
   }
 
-  state.extractJob = { id: null, title, status: "queued", progress: 0, stage: "Queued" };
+  const vocalSplitMode = state.selected.vocals ? state.vocalSplitMode : "all";
+  state.extractJob = { id: null, title, status: "queued", progress: 0, stage: "Queued", vocalSplitMode };
   render();
 
   let jobId;
@@ -602,8 +667,40 @@ async function startExtraction() {
   state.extractJob.id = jobId;
   state.extractFile = null;
   state.extractUrl = "";
+  state.vocalSplitMode = "all";
   followExtraction(jobId);
   render();
+}
+
+function _finishExtractJob(jobId) {
+  const finishedId = jobId;
+  setTimeout(() => {
+    if (state.extractJob && state.extractJob.id === finishedId) {
+      state.extractJob = null;
+      if (state.tab === "extract") render();
+    }
+  }, 4000);
+}
+
+// Chains the on-demand lead/backing vocal split (#275) onto the base job's
+// completion when the user picked "Lead + Backing" on the Extract screen --
+// from their perspective this is one action, even though the backend keeps
+// it a separate, best-effort pass over the already-done job.
+async function _runVocalSplitThenFinish(jobId) {
+  state.extractJob.stage = "Splitting lead/backing vocals…";
+  if (state.tab === "extract") render();
+  try {
+    const res = await fetch(`/api/jobs/${jobId}/vocal-split`, { method: "POST" });
+    if (!res.ok && res.status !== 202) throw new Error(String(res.status));
+    toast("Stems ready!");
+  } catch (e) {
+    console.warn("[mobile] vocal split failed:", e);
+    // The base separation still succeeded -- the split is a best-effort
+    // extra, so this is a lesser notice, not a failure of the whole import.
+    toast("Stems ready (lead/backing split didn't work this time).");
+  }
+  loadLibrary();
+  _finishExtractJob(jobId);
 }
 
 function _onExtractState(jobId, s) {
@@ -613,16 +710,14 @@ function _onExtractState(jobId, s) {
   state.extractJob.stage = s.stage || s.status;
   if (state.tab === "extract") render();
   if (s.status === "done" || s.status === "error" || s.status === "cancelled") {
-    if (s.status === "done") { toast("Stems ready!"); loadLibrary(); }
-    else if (s.status === "error") toast("Extraction failed.");
-    const finishedId = jobId;
-    setTimeout(() => {
-      if (state.extractJob && state.extractJob.id === finishedId) {
-        state.extractJob = null;
-        if (state.tab === "extract") render();
-      }
-    }, 4000);
-    return true; // terminal
+    if (s.status === "done" && state.extractJob.vocalSplitMode === "split") {
+      _runVocalSplitThenFinish(jobId);
+    } else {
+      if (s.status === "done") { toast("Stems ready!"); loadLibrary(); }
+      else if (s.status === "error") toast("Extraction failed.");
+      _finishExtractJob(jobId);
+    }
+    return true; // terminal for the base-job follow (SSE/poll can stop)
   }
   return false;
 }
@@ -749,9 +844,14 @@ function closeSwipe() {
 async function deleteTrack(id) {
   state.swipedTrackId = null;
   try {
-    await fetch(`/api/jobs/${id}`, { method: "DELETE" });
+    // Trash, not DELETE. This is a swipe on a touch screen with no undo, and
+    // DELETE removes the stems from disk for good. The desktop has always
+    // moved tracks to a Trash folder instead; now that the Trash lives on the
+    // server, this screen can do the same thing rather than being the one
+    // place in StemDeck where a stray thumb destroys a separation.
+    await fetch(`/api/jobs/${encodeURIComponent(id)}/trash`, { method: "POST" });
   } catch (e) {
-    console.warn("[mobile] delete failed:", e);
+    console.warn("[mobile] could not move track to trash:", e);
   }
   state.tracks = state.tracks.filter((t) => t.id !== id);
   if (!state.tracks.length) state.libState = "empty";
@@ -760,7 +860,7 @@ async function deleteTrack(id) {
     state.current = null;
     state.playing = false;
   }
-  toast("Track deleted");
+  toast("Moved to Trash");
   render();
 }
 
@@ -805,6 +905,18 @@ function wireFaders() {
       if (engine) engine.setPlaybackRate(rate);
     });
   }
+
+  app.querySelectorAll("[data-key-step]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (!engine?.setStemPitch) return;
+      const next = clampPitch(state.pitch + Number(btn.dataset.keyStep));
+      if (next === state.pitch) return;
+      state.pitch = next;
+      // Every lane together: this screen has no per-lane keys to preserve.
+      for (const lane of lanes()) engine.setStemPitch(lane.name, next);
+      render();
+    });
+  });
 
   const bars = app.querySelector("[data-seek]");
   if (bars) {
@@ -877,6 +989,21 @@ app.addEventListener("click", (e) => {
       break;
     case "chip":
       state.selected[t.dataset.id] = !state.selected[t.dataset.id];
+      // Vocals switched on from its own chip has not been told which of the
+      // two ways it should come out, so it takes Combined, as on the desktop.
+      if (t.dataset.id === "vocals" && state.selected.vocals) state.vocalSplitMode = "all";
+      break;
+    case "vocalmode":
+      // The pair is the vocals control, not a setting that waits for the chip.
+      // Pressing the mode already in force switches vocals off; pressing the
+      // other switches mode and leaves them on; either one from cold switches
+      // them on in that mode.
+      if (state.selected.vocals && state.vocalSplitMode === t.dataset.mode) {
+        state.selected.vocals = false;
+      } else {
+        state.vocalSplitMode = t.dataset.mode;
+        state.selected.vocals = true;
+      }
       break;
     case "qual":
       state.quality = t.dataset.q;
@@ -896,6 +1023,11 @@ app.addEventListener("click", (e) => {
     case "open": {
       const track = state.tracks.find((x) => x.id === t.dataset.id);
       if (track) openTrack(track);
+      return;
+    }
+    case "reimport": {
+      const track = state.tracks.find((x) => x.id === t.dataset.id);
+      if (track) reimportTrack(track);
       return;
     }
     case "reload":
@@ -918,6 +1050,31 @@ app.addEventListener("change", (e) => {
     render();
   }
 });
+
+// A track's files are gone (folder deleted or moved outside the app).
+// URL-sourced tracks can be rebuilt by re-running the import; a local upload
+// has no source bytes left (the pipeline deletes the upload once it's done
+// with it), so that just gets a toast pointing at re-upload instead.
+async function reimportTrack(card) {
+  if (!card.sourceUrl || card.sourceUrl.startsWith("local:")) {
+    toast("This track's audio is gone. Re-upload it to restore it.");
+    return;
+  }
+  toast("Reimporting…");
+  try {
+    const res = await fetch("/api/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: card.sourceUrl, stems: card.selectedStems || [] }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    await loadLibrary();
+  } catch (e) {
+    console.warn("[mobile] reimport failed:", e);
+    toast(`Couldn't reimport: ${e.message}`);
+  }
+}
 
 // Load the real library from /api/jobs (newest first). On success, seed the
 // Mixer with the most recent track if nothing is selected yet.

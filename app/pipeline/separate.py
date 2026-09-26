@@ -48,6 +48,11 @@ def _kill_worker() -> None:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+            # kill() only sends the signal. Without the reap a worker wedged in
+            # an uninterruptible CUDA call becomes a zombie whose pipes are
+            # closed only incidentally, whenever the Popen refcount happens to
+            # drop. vocal_split.py already pairs the two.
+            proc.communicate()
 
 
 def _get_worker(device: str) -> subprocess.Popen:
@@ -60,6 +65,16 @@ def _get_worker(device: str) -> subprocess.Popen:
     _kill_worker()
 
     env = os.environ.copy()
+    # Our pid, not whatever the backend inherited: the worker watches this and
+    # exits when we are gone, so it cannot be left holding a GPU after a kill
+    # that ran no cleanup (SIGKILL, Force Quit, Task Manager, a crash).
+    env["STEMDECK_PARENT_PID"] = str(os.getpid())
+    # Pin the child's stdio encoding to match what the parent now decodes with.
+    # Without it a Windows child writes cp1252 while the parent reads utf-8, so
+    # the mismatch simply moves rather than being fixed. Demucs and audio-
+    # separator both emit progress bars and can echo track metadata, neither of
+    # which is guaranteed to be cp1252-safe.
+    env["PYTHONIOENCODING"] = "utf-8:replace"
     try:
         import certifi
 
@@ -73,7 +88,14 @@ def _get_worker(device: str) -> subprocess.Popen:
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        # utf-8/replace explicitly. text=True alone decodes with the locale
+        # encoding, which on Windows is cp1252, and a single byte outside it
+        # in a child's output kills the whole job with a UnicodeDecodeError
+        # ("'charmap' codec can't decode byte 0x8f"). This is diagnostic text:
+        # a byte we cannot read is never a reason to fail a separation.
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         env=env,
     )
@@ -91,6 +113,10 @@ def _run_demucs(job: Job, source: Path, job_dir: Path, device: str) -> tuple[int
     spawn_at = time.monotonic()
     proc = _get_worker(device)
     if proc.stdin is None or proc.stderr is None:
+        # Raised before the try below, so nothing else tears this down, and a
+        # worker without pipes would otherwise stay cached and be handed to
+        # every subsequent job.
+        _kill_worker()
         raise RuntimeError("demucs worker has no stdin/stderr pipe")
     set_proc(job.id, proc)
 
@@ -186,13 +212,18 @@ def _run_demucs(job: Job, source: Path, job_dir: Path, device: str) -> tuple[int
         _done_evt.set()
         set_proc(job.id, None)
         wt.join(timeout=2)
-
-    # Never reuse a worker after anything but a clean success: a cancel
-    # (proc.terminate() from the API thread) already killed it; a failure's
-    # GPU/CUDA state afterward isn't something we can vouch for. Only the
-    # happy path keeps the worker warm for the next job.
-    if job_ok is not True:
-        _kill_worker()
+        # Never reuse a worker after anything but a clean success: a cancel
+        # (proc.terminate() from the API thread) already killed it; a failure's
+        # GPU/CUDA state afterward isn't something we can vouch for. Only the
+        # happy path keeps the worker warm for the next job.
+        #
+        # Inside the finally, not after it: an exception out of the read loop
+        # -- proc.stderr.read(1) raising OSError when the API thread's
+        # terminate() races the read, or _set() raising -- skipped this
+        # entirely and left a worker whose CUDA state followed an exception
+        # warm for the next job (#514).
+        if job_ok is not True:
+            _kill_worker()
 
     # POST /cancel calls proc.terminate() directly, which causes the read
     # loop above to hit EOF. Translate that into JobCancelled before the
@@ -236,6 +267,11 @@ def separate(job: Job, source: Path, job_dir: Path) -> Path:
         # Partial output from the failed attempt must not be mistaken for
         # results by collect(); CPU restarts from scratch, so does progress.
         shutil.rmtree(job_dir / DEMUCS_MODEL, ignore_errors=True)
+        # The rmtree above can take seconds on a multi-GB partial result, and
+        # nothing is registered for cancel during it. Re-check before paying
+        # for a full CPU pass the user has already asked to stop (#514).
+        if job.cancel_requested:
+            raise JobCancelled()
         _set(job, progress=0.0, stage="GPU failed — retrying on CPU (slower)...")
         job.gpu_fallback = True
         job.compute_device = f"cpu (fallback from {device})"

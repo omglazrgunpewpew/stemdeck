@@ -27,6 +27,9 @@ Protocol:
     failure already meant "process is dead, next attempt spawns fresh" --
     the reuse win only applies to the happy path.
   - EOF on stdin (parent closed the pipe) ends the worker's loop cleanly.
+  - STEMDECK_PARENT_PID, if set, arms a watchdog that exits the worker when
+    that process disappears. See _watch_parent for why the pipe alone is not
+    enough.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ import sys
 from pathlib import Path
 
 from app.core.config import DEMUCS_MODEL
+from app.core.process import arm_parent_watchdog
 
 
 def _run_one_job(model, device: str, req: dict) -> None:
@@ -84,6 +88,7 @@ def _run_one_job(model, device: str, req: dict) -> None:
 
 def main() -> None:
     device = sys.argv[1] if len(sys.argv) > 1 else "cpu"
+    arm_parent_watchdog()
 
     from demucs.pretrained import get_model
 

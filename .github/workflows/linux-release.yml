@@ -102,8 +102,12 @@ jobs:
 
       - name: build Linux CPU
         run: |
+          # PUBLISH_UPDATER_ASSETS=1 also emits the slim app-layer asset the
+          # in-app updater downloads (#421). Built once here: StemDeck and
+          # backend/ are identical in both variants.
           PACKAGE_NAME=StemDeck-Linux-x64 \
           PACKAGE_VERSION="$VERSION" \
+          PUBLISH_UPDATER_ASSETS=1 \
             bash scripts/linux/make-portable.sh
           # Drop the uncompressed stage but keep the tarball; frees disk for the
           # larger NVIDIA build. The Tauri binary under target/ is preserved.
@@ -135,13 +139,41 @@ jobs:
             clamscan --recursive --infected --bell /scan
           echo "ClamAV scan completed successfully. No infected files reported."
 
+      # macos-release.yml asserts its assets exist before uploading; this did
+      # not. action-gh-release defaults fail_on_unmatched_files to false, so a
+      # missing updater asset published a release that looked fine and went
+      # green, and the in-app updater then 404'd for every installed user.
+      - name: verify every asset exists
+        if: github.event_name == 'release'
+        run: |
+          for f in \
+            dist/StemDeck-Linux-x64.tar.gz \
+            dist/StemDeck-Linux-x64.tar.gz.sha256 \
+            dist/StemDeck-Linux-x64.NVIDIA.tar.gz \
+            dist/StemDeck-Linux-x64.NVIDIA.tar.gz.sha256 \
+            dist/StemDeck-Linux-x64-app.tar.gz \
+            dist/StemDeck-Linux-x64-app.tar.gz.sha256 \
+            dist/StemDeck-Linux-x64-runtime-version.json; do
+            test -f "$f" || { echo "missing release asset: $f" >&2; exit 1; }
+          done
+
       - name: upload artifacts
         # Only attach to a real release; a manual test build has nothing to upload to.
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
         with:
+          # Carry the release's own flag. The action defaults `prerelease` to
+          # false and writes it back, so attaching assets silently promoted a
+          # pre-release to the latest release -- which also fires `released`,
+          # pushing :latest to GHCR, and makes the in-app updater offer a build
+          # that was never verified.
+          prerelease: ${{ github.event.release.prerelease }}
+          fail_on_unmatched_files: true
           files: |
             dist/StemDeck-Linux-x64.tar.gz
             dist/StemDeck-Linux-x64.tar.gz.sha256
             dist/StemDeck-Linux-x64.NVIDIA.tar.gz
             dist/StemDeck-Linux-x64.NVIDIA.tar.gz.sha256
+            dist/StemDeck-Linux-x64-app.tar.gz
+            dist/StemDeck-Linux-x64-app.tar.gz.sha256
+            dist/StemDeck-Linux-x64-runtime-version.json

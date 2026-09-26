@@ -2,9 +2,20 @@
 import { STEM_NAMES } from "./constants.js";
 import { wireUpAudio, updateFooterTrack } from "./player.js";
 import { initSections } from "./sections.js";
-import { bpmChip, keyChip, saveSelectedStems, selectedStems, titleEl } from "./state.js";
-import { showError, importFromUrl } from "./job.js";
-import { fmtTime, storeGet, storeSet } from "./utils.js";
+import { bpmChip, foregroundJobId, keyChip, saveSelectedStems, selectedStems, titleEl } from "./state.js";
+import { refreshStemChoiceVisuals } from "./stemChoice.js";
+import { trackFormat, formatIconSvg, paintNowPlayingArt } from "./formatIcon.js";
+import { showError, importFromUrl, detachForegroundJob, runVocalSplitIfWanted } from "./job.js";
+import {
+  cancelQueuedJob, getQueueSnapshot, isPaused, onJobSettled, onQueueChange,
+  queueCount, queueRowStates, reorderQueuedJob, runningLabel, startQueue,
+  startQueueStream,
+} from "./queue.js";
+import { fmtTime, isReimportableSource, storeGet, storeSet } from "./utils.js";
+import { notifyFailure, setReleasePending, dismissFailuresByJobId, dismissFailuresByKind } from "./notifications.js";
+// Aliased (not the bare "t") -- this file already uses "t"/"tr" as local
+// variable names for track objects and table rows in several scopes.
+import { t as i18nT, plural as i18nPlural, LANGUAGES, getLanguage, setLanguage, onLanguageChange, applyTranslations } from "./i18n.js";
 
 // Escape user-supplied strings before inserting into innerHTML.
 function esc(s) {
@@ -19,57 +30,178 @@ const STORAGE_KEY = "stemdeck.folders";
 const STORAGE_VERSION = 2; // bump to wipe stale seeded data
 const DELETED_JOBS_KEY = "stemdeck.deleted_jobs";
 
-// Curated "Our Friends" partners shown at the bottom of the library. Add an
-// entry here to feature another store/band/etc. Logos are bundled under
-// static/img/friends/ so they render offline. Links open externally via the
-// document-level a[target="_blank"] handler in main.js (Tauri open_url).
-const FRIENDS = [
-  { name: "Dlima Guitars", url: "https://www.instagram.com/dlimaguitars", logo: "/img/friends/dlima-guitars-ig.jpg", avatar: true },
-  { name: "Lisbon Guitar Works", url: "https://dlimaguitars.com", logo: "/img/friends/lisbon-guitar-works.webp" },
+// Curated "We Recommend" partners shown in the library's supporters dialog,
+// grouped into categories that render in this order. Add an entry to a group's
+// `members` to feature another store/band/etc.
+//
+// Logos are bundled under static/img/friends/ so they render offline. An entry
+// with `avatar: true` has a square profile photo, cropped to a circle; without
+// it the image is treated as a transparent wordmark and letterboxed into the
+// same slot. An entry with no `logo` at all falls back to an initial badge.
+//
+// `labelKey` and `roleKey` are i18n keys rather than literals: the rendered
+// nodes carry them as data-i18n, so setLanguage()'s applyTranslations(document)
+// pass re-resolves the text without the dialog having to be rebuilt.
+//
+// Links open externally via the document-level a[target="_blank"] handler in
+// main.js (Tauri open_url on desktop).
+const FRIEND_GROUPS = [
   {
-    name: "Joao Gaspar",
-    role: "Producer/Film Scorer, Touring/Session Musician",
-    url: "https://www.instagram.com/jay_glaspar",
-    logo: "/img/friends/joao-gaspar.jpg",
-    avatar: true,
+    labelKey: "friends.cat.artists",
+    members: [
+      {
+        name: "Joao Gaspar",
+        roleKey: "friends.role.joaoGaspar",
+        url: "https://www.instagram.com/jay_glaspar",
+        logo: "/img/friends/joao-gaspar.jpg",
+        avatar: true,
+      },
+      {
+        name: "More Notes Less Talk",
+        roleKey: "friends.role.moreNotesLessTalk",
+        url: "https://www.youtube.com/@morenoteslesstalk",
+      },
+      {
+        name: "Analog4Lyfe",
+        roleKey: "friends.role.analog4lyfe",
+        url: "https://www.instagram.com/analog4lyfe",
+        logo: "/img/friends/analog4lyfe.jpg",
+        avatar: true,
+      },
+      {
+        name: "Dead röses",
+        roleKey: "friends.role.deadRoses",
+        url: "https://www.instagram.com/dead_rosesband",
+        logo: "/img/friends/dead-roses.jpg",
+        avatar: true,
+      },
+      {
+        name: "Killah Trakz",
+        roleKey: "friends.role.killahTrakz",
+        url: "https://www.instagram.com/killahtrakz/",
+        logo: "/img/friends/killah-trakz.jpg",
+        avatar: true,
+      },
+      {
+        name: "NIHIL",
+        roleKey: "friends.role.nihil",
+        url: "https://www.instagram.com/somosnihil/",
+        logo: "/img/friends/nihil.jpg",
+        avatar: true,
+      },
+    ],
   },
   {
-    name: "Kris Luthier",
-    role: "Luthier and Musical Instrument Repair, Lisboa",
-    url: "https://www.instagram.com/krisluthier",
-    logo: "/img/friends/kris-luthier.jpg",
-    avatar: true,
+    labelKey: "friends.cat.builders",
+    members: [
+      {
+        name: "Dlima Guitars",
+        roleKey: "friends.role.dlimaGuitars",
+        url: "https://www.instagram.com/dlimaguitars",
+        logo: "/img/friends/dlima-guitars-ig.jpg",
+        avatar: true,
+      },
+      {
+        name: "Lisbon Guitar Works",
+        roleKey: "friends.role.lisbonGuitarWorks",
+        url: "https://dlimaguitars.com",
+        logo: "/img/friends/lisbon-guitar-works.webp",
+      },
+      {
+        name: "Kris Luthier",
+        roleKey: "friends.role.krisLuthier",
+        url: "https://www.instagram.com/krisluthier",
+        logo: "/img/friends/kris-luthier.jpg",
+        avatar: true,
+      },
+    ],
   },
   {
-    name: "Thomann",
-    role: "Online Music Store",
-    url: "https://www.instagram.com/thomann.music",
-    logo: "/img/friends/thomann.jpg",
-    avatar: true,
+    labelKey: "friends.cat.gear",
+    members: [
+      {
+        name: "Empress Effects",
+        roleKey: "friends.role.empressEffects",
+        url: "https://empresseffects.com",
+        logo: "/img/friends/empress-effects.png",
+      },
+      {
+        name: "Thomann",
+        roleKey: "friends.role.thomann",
+        url: "https://www.instagram.com/thomann.music",
+        logo: "/img/friends/thomann.jpg",
+        avatar: true,
+      },
+    ],
   },
   {
-    name: "Analog4Lyfe",
-    role: "Analog music gear",
-    url: "https://www.instagram.com/analog4lyfe",
-    logo: "/img/friends/analog4lyfe.jpg",
-    avatar: true,
+    labelKey: "friends.cat.karaoke",
+    members: [
+      {
+        name: "Beltr",
+        roleKey: "friends.role.beltr",
+        url: "https://beltr.app/",
+        logo: "/img/friends/beltr.jpg",
+        avatar: true,
+      },
+      {
+        name: "Seratone",
+        roleKey: "friends.role.seratone",
+        url: "https://seratone.audio/",
+        logo: "/img/friends/seratone.jpg",
+        avatar: true,
+      },
+    ],
   },
   {
-    name: "Empress Effects",
-    role: "Effects pedals",
-    url: "https://empresseffects.com",
-    logo: "/img/friends/empress-effects.png",
+    labelKey: "friends.cat.media",
+    members: [
+      {
+        name: "slashCAM",
+        roleKey: "friends.role.slashcam",
+        url: "https://www.instagram.com/slashcam.de",
+        logo: "/img/friends/slashcam.webp",
+      },
+      {
+        name: "r/bass",
+        roleKey: "friends.role.rbass",
+        url: "https://www.reddit.com/r/Bass/",
+      },
+      {
+        name: "Not Another Audio Podcast",
+        roleKey: "friends.role.notAnotherAudioPodcast",
+        url: "https://directory.libsyn.com/shows/view/id/20f5a1e3-6fea-4d41-8cdf-451ce6fc6cda",
+        logo: "/img/friends/not-another-audio-podcast.jpg",
+        avatar: true,
+      },
+    ],
   },
   {
-    name: "More Notes Less Talk",
-    role: "YouTube channel",
-    url: "https://www.youtube.com/@morenoteslesstalk",
+    labelKey: "friends.cat.writers",
+    members: [
+      {
+        name: "Alexandre Borges",
+        roleKey: "friends.role.alexandreBorges",
+        url: "https://www.instagram.com/alexgram_b/",
+        logo: "/img/friends/alexandre-borges.jpg",
+        avatar: true,
+      },
+    ],
   },
 ];
 
 // Instagram glyph (Simple Icons), shown under tiles that link to Instagram.
 const IG_ICON_PATH =
   "M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z";
+
+// Generic link glyph (Feather "link"), shown on cards that do not link to
+// Instagram. Stroked rather than filled, so it needs its own CSS class.
+const LINK_ICON_PATHS = [
+  "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71",
+  "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71",
+];
+
+const SVGNS = "http://www.w3.org/2000/svg";
 
 let folders = [];
 let tracks = {};
@@ -94,18 +226,28 @@ function getDeletedJobIds() {
   return _deletedJobIds;
 }
 
-function markJobsDeleted(ids) {
+async function markJobsDeleted(ids) {
   for (const id of ids) _deletedJobIds.add(id);
-  storeSet(DELETED_JOBS_KEY, [..._deletedJobIds]).catch((e) =>
-    console.warn("[catalog] failed to persist deleted jobs", e)
-  );
+  // Awaited by callers before they purge. Fire-and-forget meant that quitting
+  // soon after clearing the bin -- or one failed store write -- left no
+  // tombstone, and syncWithServer re-imported everything on the next launch
+  // (#521). The backend keeps its own deletion record now, so this is a second
+  // line of defence rather than the only one, but it still has to be written
+  // before the tracks are dropped from the local index.
+  try {
+    await storeSet(DELETED_JOBS_KEY, [..._deletedJobIds]);
+    return true;
+  } catch (e) {
+    console.warn("[catalog] failed to persist deleted jobs", e);
+    return false;
+  }
 }
 
 function normalizeFolderColor(color) {
   return FOLDER_COLORS.includes(color) ? color : DEFAULT_FOLDER_COLOR;
 }
 
-function makeFolder({ id = `f-${Date.now()}`, name = "New folder", collapsed = false, items = [], parentId = null } = {}) {
+function makeFolder({ id = `f-${Date.now()}`, name = i18nT("library.newFolder"), collapsed = false, items = [], parentId = null } = {}) {
   return { id, name, collapsed, items, color: DEFAULT_FOLDER_COLOR, parentId: parentId ?? null };
 }
 
@@ -148,9 +290,10 @@ function trackMatchesSearch(track) {
     if (!tag) return true;
     return (track?.tags ?? []).some((t) => String(t).toLowerCase().includes(tag));
   }
+  // Not `channel`: it was a stored status label, not something a person would
+  // search by, and old tracks still carry it (#656).
   return [
     track?.title,
-    track?.channel,
     track?.sourceUrl,
     ...(track?.stems || []),
     ...(track?.tags || []),
@@ -187,6 +330,10 @@ function purgeTrash() {
     folder.items = folder.items.filter((id) => !trashIds.has(id));
   }
   trash.items = [];
+  // Catches a job that errored after its track was trashed but before this
+  // permanent delete — moveTrackToTrash's own dismiss already fired earlier
+  // and can't have caught a failure that didn't exist yet (#401).
+  for (const id of trashIds) dismissFailuresByJobId(id);
   return true;
 }
 
@@ -253,19 +400,26 @@ function saveState() {
 // ─── Track management ───
 
 export function addTrackToLibrary(track) {
-  // track: { id, title, channel, thumb, stems, status, sourceUrl }
+  // track: { id, title, thumb, stems, status, sourceUrl }
   const existingId = findTrackBySource(track.sourceUrl, track.id);
-  if (existingId) {
-    const trash = getTrashFolder();
-    const inTrash = trash?.items.includes(existingId);
-    if (inTrash) {
-      // Old track was trashed — delete it silently so the new import lands
-      // in the library instead of inheriting the trash placement.
-      delete tracks[existingId];
-      for (const f of folders) f.items = f.items.filter((id) => id !== existingId);
-    } else {
-      replaceTrackId(existingId, track.id);
-    }
+  // A match already in the Trash is left exactly where it is. It is a distinct
+  // job with its own files on disk, and the user is the only one who decides
+  // when those go. The new track is in no folder yet, so the placement below
+  // still lands it in the library; evicting the old one was never what put it
+  // there.
+  //
+  // Evicting it did real damage: it dropped the catalog entry without deleting
+  // the job, so the directory and its registry record outlived their only
+  // reference. syncWithServer then found a job with no track, no trash entry
+  // and no tombstone, and re-adopted it into the library on the next launch.
+  // One extra job sharing the source URL was enough to reach this, so trashing
+  // a track and restarting brought it back.
+  if (existingId && !getTrashFolder()?.items.includes(existingId)) {
+    replaceTrackId(existingId, track.id);
+    // The old track is gone, so any failure notification tied to it is moot
+    // now (#401). A trashed match keeps the dismissal moveTrackToTrash already
+    // did, and nothing here revives it.
+    dismissFailuresByJobId(existingId);
   }
   const existing = tracks[track.id] || {};
   tracks[track.id] = {
@@ -279,7 +433,7 @@ export function addTrackToLibrary(track) {
     // Put into first non-trash folder or create an "Unsorted" folder.
     let target = folders.find((folder) => folder.id !== TRASH_ID);
     if (!target) {
-      target = makeFolder({ id: "f-unsorted", name: "Unsorted" });
+      target = makeFolder({ id: "f-unsorted", name: i18nT("folder.unsorted") });
       folders.unshift(target);
     }
     target.items.unshift(track.id);
@@ -335,9 +489,12 @@ function stateMetadataToTrack(state, fallbackTrack) {
     tempoStability: state.tempo_stability ?? fallbackTrack.tempoStability,
     tags: state.tags ?? fallbackTrack.tags ?? [],
     sections: state.sections ?? fallbackTrack.sections ?? null,
+    sectionsSource: state.sections_source ?? fallbackTrack.sectionsSource ?? null,
     sourceUrl: state.source_url || fallbackTrack.sourceUrl,
+    sourceFormat: state.source_format ?? fallbackTrack.sourceFormat ?? null,
     mixUrl: state.mix_url ?? fallbackTrack.mixUrl ?? null,
     hasVideo: state.has_video ?? fallbackTrack.hasVideo ?? false,
+    videoStatus: state.video_status ?? fallbackTrack.videoStatus ?? null,
     createdAt: fallbackTrack.createdAt ?? state.created_at,
     favorite: fallbackTrack.favorite ?? false,
   };
@@ -345,45 +502,56 @@ function stateMetadataToTrack(state, fallbackTrack) {
 
 function fmtExtracted(ts) {
   if (!ts) return "—";
+  // Short form ("Aug 14, 11:43 AM") -- this now lives in the footer's single
+  // compact meta line (#269 follow-up rebuild), which has no room for the
+  // long month name and year the summary panel's date affords.
   return new Date(ts * 1000).toLocaleString("en-US", {
-    month: "long", day: "numeric", year: "numeric",
+    month: "short", day: "numeric",
     hour: "numeric", minute: "2-digit",
   });
 }
 
 function deriveSource(sourceUrl) {
   if (!sourceUrl) return "—";
-  if (sourceUrl.startsWith("local:")) return "Local file";
+  if (sourceUrl.startsWith("local:")) return i18nT("track.localFile");
   if (sourceUrl.includes("youtube.com") || sourceUrl.includes("youtu.be")) return "YouTube";
   if (sourceUrl.includes("soundcloud.com")) return "SoundCloud";
-  return "Web";
+  return i18nT("track.web");
 }
 
-function deriveQuality(sourceUrl) {
+function deriveQuality(track) {
+  const sourceUrl = track?.sourceUrl;
   if (!sourceUrl) return "—";
   if (sourceUrl.startsWith("local:")) {
-    const ext = sourceUrl.split(".").pop()?.toLowerCase();
-    if (ext === "wav") return "Lossless (WAV)";
-    if (ext === "mp3") return "Compressed (MP3)";
-    return "Local file";
+    // From the format the server reports, not from sourceUrl: that is
+    // "local:<title>" with the extension removed, so "Lossless (WAV)" never
+    // appeared for a real upload, and a title with a dot in it was misread
+    // (#690).
+    const format = track.sourceFormat;
+    if (format === "wav") return i18nT("track.losslessWav");
+    if (format === "mp3") return i18nT("track.compressedMp3");
+    return i18nT("track.localFile");
   }
-  if (sourceUrl.includes("youtube.com") || sourceUrl.includes("youtu.be")) return "High";
-  if (sourceUrl.includes("soundcloud.com")) return "Compressed (MP3)";
+  if (sourceUrl.includes("youtube.com") || sourceUrl.includes("youtu.be")) return i18nT("track.qualityHigh");
+  if (sourceUrl.includes("soundcloud.com")) return i18nT("track.compressedMp3");
   return "—";
 }
 
+// Same buckets as job.js's dr.*/stability.* labels (duplicated here rather
+// than imported: this file renders a saved track's stats after reload, job.js
+// renders a job actively in progress -- same thresholds, different data path).
 function drLabel(dr) {
-  if (dr < 7) return "Compressed";
-  if (dr < 10) return "Moderate";
-  if (dr < 14) return "High";
-  return "Wide";
+  if (dr < 7) return i18nT("job.dr.compressed");
+  if (dr < 10) return i18nT("job.dr.moderate");
+  if (dr < 14) return i18nT("job.dr.high");
+  return i18nT("job.dr.wide");
 }
 
 function stabilityLabel(pct) {
-  if (pct >= 90) return "Very Stable";
-  if (pct >= 70) return "Stable";
-  if (pct >= 50) return "Moderate";
-  return "Variable";
+  if (pct >= 90) return i18nT("job.stability.veryStable");
+  if (pct >= 70) return i18nT("job.stability.stable");
+  if (pct >= 50) return i18nT("job.stability.moderate");
+  return i18nT("job.stability.variable");
 }
 
 export function applyStemPresenceCards(stemPresence) {
@@ -403,7 +571,7 @@ export function applyStemPresenceCards(stemPresence) {
 }
 
 function applyTrackInfoToPanel(track) {
-  titleEl.textContent = track.title || "Untitled track";
+  titleEl.textContent = track.title || i18nT("track.untitled");
   bpmChip.textContent = track.bpm ? `${track.bpm} BPM` : "— BPM";
   keyChip.textContent = track.key || "— —";
   updateFooterTrack({
@@ -411,7 +579,7 @@ function applyTrackInfoToPanel(track) {
     thumbnail: track.thumb,
     key: track.key,
     bpm: track.bpm,
-    stemCount: (track.audioStems || track.stems || []).filter((s) => (s.name ?? s) !== "original").length || null,
+    stemCount: stemCountOf(track) || null,
   });
   applyStemPresenceCards(track.stemPresence);
 
@@ -430,16 +598,23 @@ function applyTrackInfoToPanel(track) {
   if (summaryScale) summaryScale.textContent = track.scale || "";
   if (summaryScaleName) summaryScaleName.textContent = track.scale || "—";
   if (summaryLufs) summaryLufs.textContent = track.lufs != null ? Number(track.lufs).toFixed(1) : "—";
-  if (summaryPeak) summaryPeak.textContent = track.peakDb != null ? `Peak ${Number(track.peakDb).toFixed(1)} dB` : "";
+  if (summaryPeak) summaryPeak.textContent = track.peakDb != null ? i18nT("job.peakDb", { value: Number(track.peakDb).toFixed(1) }) : "";
   if (summaryDuration) summaryDuration.textContent = track.duration ? fmtTime(track.duration) : "—";
 
   const trackExtracted = document.getElementById("track-extracted");
   const trackSource = document.getElementById("track-source");
   const trackQuality = document.getElementById("track-quality");
   const favBtn = document.getElementById("fav-btn");
+  // Static duration for the footer's compact meta line -- deliberately not
+  // #t-time, which live-updates during playback and would duplicate the
+  // Position group in the transport row below it.
+  const metaDuration = document.getElementById("t-meta-duration");
+  if (metaDuration) metaDuration.textContent = track.duration ? fmtTime(track.duration) : "—";
   if (trackExtracted) trackExtracted.textContent = fmtExtracted(track.createdAt);
   if (trackSource) trackSource.textContent = deriveSource(track.sourceUrl);
-  if (trackQuality) trackQuality.textContent = deriveQuality(track.sourceUrl);
+  if (trackQuality) trackQuality.textContent = deriveQuality(track);
+  // The now-playing square shows the same format icon the library row does.
+  paintNowPlayingArt(trackFormat(track));
   if (favBtn) {
     favBtn.classList.toggle("active", Boolean(track.favorite));
     favBtn.setAttribute("aria-pressed", String(Boolean(track.favorite)));
@@ -483,23 +658,46 @@ function applyTrackInfoToPanel(track) {
   }
 }
 
+/**
+ * Tell the server a track was binned or brought back.
+ *
+ * The Trash used to be purely local, which meant it was per-device: a track
+ * deleted here stayed in GET /api/jobs, and the phone UI builds its whole
+ * library from that endpoint, so it listed everything the user thought they
+ * had thrown away. The local folders are still the desktop's own view; this is
+ * what makes the server agree with it.
+ *
+ * Deliberately not awaited by the callers. Binning a track must feel instant
+ * and must not fail because the backend blinked; the reconcile on next load
+ * catches anything that did not land.
+ */
+function syncTrashToServer(trackId, trashed) {
+  const action = trashed ? "trash" : "restore";
+  fetch(`/api/jobs/${encodeURIComponent(trackId)}/${action}`, { method: "POST" })
+    .catch((e) => console.warn(`[catalog] could not ${action} ${trackId} on the server`, e));
+}
+
 function moveTrackToTrash(trackId) {
   if (!tracks[trackId]) return;
   removeTrackFromFolders(trackId);
   const trash = getTrashFolder();
   if (trash && !trash.items.includes(trackId)) trash.items.unshift(trackId);
   if (_currentTrackId === trackId) _currentTrackId = null;
+  // The user is done with this track — clear any failure tied to it (#401).
+  // purgeTrash() does the same on permanent delete, for a job that errors
+  // after being trashed but before it's purged.
+  dismissFailuresByJobId(trackId);
+  syncTrashToServer(trackId, true);
   saveState();
   render();
 }
 
 function setCatalogView(view) {
-  catalogView = ["trash", "favorites"].includes(view) ? view : "library";
-  const app = document.querySelector(".app");
-  if (catalogView === "trash" || catalogView === "favorites") {
-    app?.classList.remove("cat-collapsed");
-    localStorage.setItem("stemdeck.catalog.collapsed", "0");
-  }
+  catalogView = ["trash", "favorites", "queue"].includes(view) ? view : "library";
+  // Switching to Trash, Favourites or Queue is a request to look at the
+  // sidebar, so a collapsed one comes back. Through the shared helper, or the
+  // collapse button's aria-expanded is left claiming the sidebar is still shut.
+  if (catalogView !== "library") setSidebarCollapsed(false);
   render();
 }
 
@@ -510,25 +708,48 @@ function applyStoredStemSelection(track) {
   selectedStems.clear();
   for (const name of next) selectedStems.add(name);
   saveSelectedStems();
-  for (const btn of document.querySelectorAll(".stem-choice[data-stem]")) {
-    btn.setAttribute("aria-pressed", String(selectedStems.has(btn.dataset.stem)));
+  // The whole row, not just the chips. Setting aria-pressed on each chip by
+  // hand here left the All button beside them claiming every stem was
+  // selected, and the Lead + Backing toggle on screen for a track with no
+  // vocals (#658).
+  refreshStemChoiceVisuals();
+}
+
+// A track's files went missing (folder deleted or moved outside the app).
+// URL-sourced tracks can be rebuilt from the source, so trigger that
+// directly rather than making the user hunt for a "resync" button in
+// Settings. Local uploads have no source bytes left to rebuild from (#354's
+// cleanup deletes the upload once the pipeline is done with it), so the
+// only path back is a fresh re-upload.
+function reimportUnavailableTrack(trackId, track) {
+  updateTrackStatus(trackId, "unavailable");
+  if (isReimportableSource(track.sourceUrl)) {
+    importFromUrl(track.sourceUrl, { title: track.title, stems: track.selectedStems });
+    return;
   }
+  showError(i18nT("track.audioUnavailableError"));
 }
 
 async function loadTrackIntoStudio(trackId) {
   let track = tracks[trackId];
   if (!track) return;
   if (track.status === "unavailable") {
-    showError("This track's audio is no longer available. Re-upload to restore it.");
+    reimportUnavailableTrack(trackId, track);
     return;
   }
+  // The user has chosen to look at something else, so the running import gives
+  // up the studio. It keeps running and keeps updating its own row; it just
+  // stops repainting this view (and, at completion, replacing the audio that
+  // is about to load here).
+  if (trackId !== foregroundJobId) detachForegroundJob();
   const hadStoredAudio = Boolean(track.audioStems?.length);
   const token = ++_loadTrackToken;
 
   // Start peaks fetch immediately — runs in parallel with job-data fetch so it
   // resolves before wireUpAudio calls Multitrack.create. This prevents peaks.json
   // from competing with stem WAV fetches for Safari's 6-connection-per-origin limit.
-  const peaksPromise = fetch(`/api/jobs/${trackId}/stems/peaks.json`)
+  // /peaks rather than stems/peaks.json: see get_peaks in app/api/stems.py.
+  const peaksPromise = fetch(`/api/jobs/${trackId}/peaks`)
     .then((r) => (r.ok ? r.json() : {}))
     .catch(() => ({}));
 
@@ -542,12 +763,16 @@ async function loadTrackIntoStudio(trackId) {
       track = stateMetadataToTrack(state, track);
       tracks[trackId] = track;
       saveState();
+      if (state.status === "unavailable") {
+        reimportUnavailableTrack(trackId, track);
+        return;
+      }
     } else if (res.status === 404) {
       track = { ...track, status: "unavailable" };
       tracks[trackId] = track;
       saveState();
       updateTrackStatus(trackId, "unavailable");
-      showError("This track's audio is no longer available. Re-upload to restore it.");
+      showError(i18nT("track.audioUnavailableError"));
       return;
     }
   } catch (e) { console.warn("[catalog] server sync failed, using stored track:", e); }
@@ -562,16 +787,71 @@ async function loadTrackIntoStudio(trackId) {
   applyStoredStemSelection(track);
   setCurrentTrack(trackId);
 
+  // The composer is an input the Split stems button submits, not a caption for
+  // the open track, so it may only ever hold something that can actually be
+  // imported. A `local:` source is a file that was uploaded once and is not
+  // reachable again; putting its bare filename here armed the button with a
+  // string that can never resolve, and pressing it POSTed "my song.mp3" as
+  // though it were a link (#635). Non-empty is also what let it through the
+  // browser's own required check.
+  //
+  // Cleared rather than left alone: whatever the previously opened track put
+  // there is still a live URL, and re-importing *that* on a click meant for
+  // this track is worse than doing nothing.
+  const importable = isReimportableSource(track.sourceUrl);
+  // A link-sourced track needs nothing new: its URL goes in the box and the
+  // button imports it again, which is what re-splitting one has always meant.
+  // An upload has no URL, so the button acts on the track itself and the
+  // server separates the source it kept beside it.
+  const resplittable = !importable && track.status === "done";
   const urlInput = document.getElementById("url");
-  if (urlInput && track.sourceUrl) {
-    urlInput.value = track.sourceUrl.startsWith("local:")
-      ? track.sourceUrl.slice(6)
-      : track.sourceUrl;
+  if (urlInput) {
+    urlInput.value = importable ? track.sourceUrl : "";
+    // `required` is the guard for "the button has nothing to act on", and it
+    // is a blunt one: the browser refuses the submit before any handler runs,
+    // so it must not be set while the button has a track to re-split. Setting
+    // it there made pressing Split stems on an upload answer "please fill out
+    // this field" instead of separating it.
+    if (importable || resplittable) urlInput.removeAttribute("required");
+    else urlInput.setAttribute("required", "");
   }
+  setResplitTarget(resplittable ? track : null);
 
   applyTrackInfoToPanel(track);
-  wireUpAudio(trackId, track.audioStems, track.duration || 0, track.thumb, track.mixUrl ?? null, track.title || "", peaksPromise, track.hasVideo ?? false);
+  wireUpAudio(trackId, track.audioStems, track.duration || 0, track.thumb, track.mixUrl ?? null, track.title || "", peaksPromise, track.hasVideo ?? false, track.videoStatus ?? null);
   initSections(trackId, track.sections, track.duration || 0);
+}
+
+/**
+ * Aim the Split stems button at a track rather than at the composer.
+ *
+ * Carried on the button itself rather than in a module variable so job.js can
+ * read it at submit time without the two files having to agree on an import
+ * order. Cleared with null whenever the open track is one the composer can
+ * handle on its own.
+ *
+ * The button's label does not change. What it does is the same thing it has
+ * always done -- split this track into stems -- and only where it reads the
+ * track from differs.
+ */
+export function setResplitTarget(track) {
+  const submitBtn = document.getElementById("submit");
+  if (!submitBtn) return;
+  submitBtn.dataset.resplitJob = track?.id ?? "";
+  submitBtn.dataset.resplitTitle = track?.title ?? "";
+  submitBtn.dataset.resplitSource = track?.sourceUrl ?? "";
+
+  // Say which audio the button will split. A link-sourced track answers that
+  // with the URL in the box; an upload has nothing submittable to put there,
+  // so without this the composer sat empty and there was no way to tell what
+  // pressing the button would act on.
+  const pill = document.getElementById("trackPill");
+  const pillName = document.getElementById("trackPillName");
+  if (pill && pillName) {
+    pillName.textContent = track?.title ?? "";
+    pillName.title = track?.title ?? "";
+    pill.classList.toggle("hidden", !track);
+  }
 }
 
 export function setCurrentTrack(trackId) {
@@ -590,6 +870,46 @@ function createFolder() {
   saveState();
   render();
   openFolderEditor(folder.id);
+}
+
+/** Put a whole playlist import in a folder of its own.
+ *
+ *  Placement happens before addTrackToLibrary, which only assigns a folder to a
+ *  track that is not in one yet -- so claiming the ids first is what keeps these
+ *  tracks out of Unsorted. Reuses an existing folder of the same name so
+ *  re-importing a playlist tops it up instead of creating a duplicate.
+ */
+export function addPlaylistToLibrary(playlistTitle, jobs) {
+  const name = String(playlistTitle || "Playlist").trim().slice(0, 80) || "Playlist";
+  let folder = folders.find((f) => f.id !== TRASH_ID && !f.parentId && f.name === name);
+  if (!folder) {
+    folder = makeFolder({ name });
+    folders.unshift(folder);
+  }
+
+  for (const job of jobs) {
+    if (!folder.items.includes(job.job_id)) folder.items.push(job.job_id);
+    addTrackToLibrary({
+      id: job.job_id,
+      title: job.title || job.source_url || i18nT("job.queuedTrack"),
+      thumb: "",
+      stems: [...selectedStems],
+      selectedStems: [...selectedStems],
+      audioStems: [],
+      status: "queued",
+      bpm: null,
+      key: null,
+      scale: null,
+      keyConfidence: null,
+      lufs: null,
+      peakDb: null,
+      sourceUrl: job.source_url,
+    });
+  }
+  folder.collapsed = false;
+  saveState();
+  render();
+  return folder.id;
 }
 
 function deleteFolder(folderId) {
@@ -676,32 +996,33 @@ function openFolderEditor(folderId) {
   const overlay = document.createElement("div");
   overlay.className = "folder-editor-backdrop";
   overlay.innerHTML = `
-    <form class="folder-editor" role="dialog" aria-modal="true" aria-label="Edit folder">
+    <form class="folder-editor" role="dialog" aria-modal="true" aria-label="Edit folder" data-i18n-aria-label="folderEditor.title">
       <div class="folder-editor-head">
-        <span>Edit folder</span>
-        <button class="folder-editor-close" type="button" aria-label="Close">
+        <span data-i18n="folderEditor.title">Edit folder</span>
+        <button class="folder-editor-close" type="button" aria-label="Close" data-i18n-aria-label="folderEditor.closeAria">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <path d="M18 6 6 18M6 6l12 12"></path>
           </svg>
         </button>
       </div>
       <label class="folder-editor-field">
-        <span>Name</span>
+        <span data-i18n="folderEditor.nameLabel">Name</span>
         <input class="folder-editor-name" type="text" maxlength="100" autocomplete="off" spellcheck="false" />
       </label>
       <div class="folder-editor-field">
-        <span>Color</span>
-        <div class="folder-editor-colors" role="group" aria-label="Folder color">
+        <span data-i18n="folderEditor.colorLabel">Color</span>
+        <div class="folder-editor-colors" role="group" aria-label="Folder color" data-i18n-aria-label="folderEditor.colorGroupAria">
           ${folderColorButtonsHtml(selectedColor)}
         </div>
       </div>
       <div class="folder-editor-msg" role="alert" aria-live="polite"></div>
       <div class="folder-editor-actions">
-        <button class="folder-editor-cancel" type="button">Cancel</button>
-        <button class="folder-editor-save" type="submit">Save</button>
+        <button class="folder-editor-cancel" type="button" data-i18n="folderEditor.cancel">Cancel</button>
+        <button class="folder-editor-save" type="submit" data-i18n="folderEditor.save">Save</button>
       </div>
     </form>
   `;
+  applyTranslations(overlay);
 
   const form = overlay.querySelector(".folder-editor");
   const input = overlay.querySelector(".folder-editor-name");
@@ -732,17 +1053,17 @@ function openFolderEditor(folderId) {
     e.preventDefault();
     const name = input.value.trim();
     if (!name) {
-      msgEl.textContent = "Enter a folder name.";
+      msgEl.textContent = i18nT("folderEditor.emptyError");
       input.focus();
       return;
     }
     if (name.length > MAX_FOLDER_NAME_LEN) {
-      msgEl.textContent = `Folder name is too long (max ${MAX_FOLDER_NAME_LEN}).`;
+      msgEl.textContent = i18nT("folderEditor.tooLong", { max: MAX_FOLDER_NAME_LEN });
       input.focus();
       return;
     }
     if (!isValidFolderName(name)) {
-      msgEl.textContent = "Use letters, numbers, spaces, or - _ ' & ( ) . ,";
+      msgEl.textContent = i18nT("folderEditor.charsError");
       input.focus();
       return; // don't save or close until the name is valid
     }
@@ -879,6 +1200,7 @@ function restoreTrackFromTrash(trackId) {
     folders.unshift(target);
   }
   if (!target.items.includes(trackId)) target.items.push(trackId);
+  syncTrashToServer(trackId, false);
   saveState();
   render();
 }
@@ -927,14 +1249,6 @@ function wireLibraryDeleteKeys() {
 
 // ─── Rendering helpers ───
 
-function getRecentTracks(trashIds, n = 3) {
-  return Object.entries(tracks)
-    .filter(([id, t]) => !trashIds.has(id) && t.title)
-    .sort(([, a], [, b]) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
-    .slice(0, n)
-    .map(([id]) => id);
-}
-
 function getAllTags(trashIds) {
   const counts = {};
   for (const [id, track] of Object.entries(tracks)) {
@@ -956,6 +1270,67 @@ function makeSectionEl(labelText) {
   return section;
 }
 
+// A URL-sourced track can be rebuilt by re-running the import; a local
+// upload has no source bytes left to rebuild from, only a re-upload gets it
+// back (see reimportUnavailableTrack).
+function canReimportTrack(track) {
+  return Boolean(track.sourceUrl) && !track.sourceUrl.startsWith("local:");
+}
+
+function unavailableWarningHtml(track) {
+  const label = canReimportTrack(track)
+    ? i18nT("track.unavailableReimport")
+    : i18nT("track.unavailableReupload");
+  return `<span class="cat-unavailable-warning">${esc(label)}</span>`;
+}
+
+/**
+ * How many stems a track has: the stem files that exist once it is done, and
+ * the ones asked for before then. The mix itself ("original") is not a stem.
+ */
+function stemCountOf(track) {
+  const stems = track?.audioStems?.length ? track.audioStems : track?.stems || [];
+  return stems.filter((s) => (s?.name ?? s) !== "original").length;
+}
+
+/**
+ * The line under a track's title, built from what is true of the track now.
+ *
+ * It used to read a `channel` field that was never a channel: six code paths
+ * stored a status label in it, as text in whatever language was active at the
+ * time, and the path that adopts a server job the library did not know about
+ * stored nothing. So two copies of the same song could read "Extracted ·
+ * 6 stems" and " · 6 stems" side by side (#656), and a label written in one
+ * language stayed in it after the user switched. Nothing is stored now, and
+ * every path that creates a track gets the same line.
+ *
+ * Returns HTML: an unavailable track's line is a warning, not plain text.
+ */
+function trackSublineHtml(track, { inTrash = false } = {}) {
+  if (track.status === "unavailable") return unavailableWarningHtml(track);
+  let parts;
+  if (PROCESSING_STATUSES.has(track.status)) {
+    parts = [i18nT("job.processing")];
+  } else if (track.status === "error") {
+    parts = [i18nT("notifKind.importFailed")];
+  } else {
+    const stems = stemCountOf(track);
+    // A done track that knows neither its length nor its stems says nothing
+    // rather than "0 stems", which would be a claim and a wrong one.
+    parts = [
+      track.duration ? fmtTime(track.duration) : "",
+      stems ? i18nPlural("footer.stemsCount", stems) : "",
+    ];
+  }
+  if (inTrash) parts.push(i18nT("track.removed"));
+  // Spaced as text as well as by the row's flex gap, so what a screen reader
+  // or a copy gets reads "05:57 · 6 stems" rather than "05:57·6 stems".
+  return parts
+    .filter(Boolean)
+    .map((part) => `<span>${esc(part)}</span>`)
+    .join(' <span class="dot">·</span> ');
+}
+
 function renderRecentItem(trackId) {
   const track = tracks[trackId];
   if (!track) return null;
@@ -963,14 +1338,11 @@ function renderRecentItem(trackId) {
   const isUnavailable = track.status === "unavailable";
   el.className = `cat-item${trackId === _currentTrackId ? " active" : ""}${isUnavailable ? " unavailable" : ""}`;
   el.dataset.id = trackId;
-  const duration = track.duration ? fmtTime(track.duration) : "";
-  const stemCount = track.stems?.length ?? 0;
-  const sub = [duration, `${stemCount} stem${stemCount !== 1 ? "s" : ""}`].filter(Boolean).join(" · ");
   el.innerHTML = `
     <div class="cat-thumb">${thumbHtml(track)}</div>
     <div class="cat-meta">
-      <div class="cat-title">${esc(track.title ?? "Unknown track")}</div>
-      <div class="cat-sub"><span>${esc(sub)}</span></div>
+      <div class="cat-title">${esc(displayTitle(track.title))}</div>
+      <div class="cat-sub">${trackSublineHtml(track)}</div>
     </div>
     <div class="cat-status${PROCESSING_STATUSES.has(track.status) ? " processing" : isUnavailable ? " unavailable" : ""}"></div>
   `;
@@ -980,8 +1352,30 @@ function renderRecentItem(trackId) {
 
 // ─── Rendering ───
 
+// A queued URL import has no title yet -- nothing has been downloaded, so the
+// only thing to show is the URL the user pasted, which renders as a truncated
+// unreadable string. Name the source instead until the real title arrives.
+const _SOURCE_LABELS = [
+  [/(^|\.)youtube\.com$|(^|\.)youtu\.be$|(^|\.)youtube-nocookie\.com$/, "YouTube"],
+  [/(^|\.)soundcloud\.com$/, "SoundCloud"],
+];
+
+export function displayTitle(title) {
+  const text = String(title ?? "").trim();
+  if (!/^https?:\/\//i.test(text)) return text || i18nT("track.unknown");
+  try {
+    const host = new URL(text).hostname.replace(/^www\./, "");
+    const match = _SOURCE_LABELS.find(([re]) => re.test(host));
+    return `${match ? match[1] : host} link`;
+  } catch {
+    return text;
+  }
+}
+
 function thumbHtml(track) {
   if (track.thumb) return `<img src="${esc(track.thumb)}" alt="" loading="lazy" />`;
+  const format = trackFormat(track);
+  if (format) return formatIconSvg(format);
   return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>`;
 }
 
@@ -1012,26 +1406,21 @@ function renderTrackItem(trackId, { inTrash = false } = {}) {
   el.className = `cat-item${trackId === _currentTrackId ? " active" : ""}${isUnavailable ? " unavailable" : ""}`;
   el.dataset.id = trackId;
 
-  const stemCount = track.stems?.length ?? 0;
   el.innerHTML = `
     <div class="cat-thumb">${thumbHtml(track)}</div>
     <div class="cat-meta">
-      <div class="cat-title">${esc(track.title ?? "Unknown track")}</div>
-      <div class="cat-sub">
-        <span>${esc(track.channel ?? "")}</span>
-        <span class="dot">·</span>
-        <span>${inTrash ? "Removed" : `${stemCount} stem${stemCount !== 1 ? "s" : ""}`}</span>
-      </div>
+      <div class="cat-title">${esc(displayTitle(track.title))}</div>
+      <div class="cat-sub">${trackSublineHtml(track, { inTrash })}</div>
     </div>
     <div class="cat-status${PROCESSING_STATUSES.has(track.status) ? " processing" : isUnavailable ? " unavailable" : ""}"></div>
-    ${inTrash ? "" : `<button class="cat-del" type="button" title="Move to Trash">
+    ${inTrash ? "" : `<button class="cat-del" type="button" title="${esc(i18nT("track.moveToTrash"))}">
       <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
         <polyline points="3 6 5 6 21 6"></polyline>
         <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path>
       </svg>
     </button>`}
   `;
-  el.querySelector(".cat-del")?.setAttribute("aria-label", `Move ${track.title ?? "track"} to Trash`);
+  el.querySelector(".cat-del")?.setAttribute("aria-label", i18nT("track.moveTitleToTrash", { title: track.title ?? i18nT("track.unknown") }));
 
   el.querySelector(".cat-del")?.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -1062,7 +1451,7 @@ function renderFolder(folder) {
     : `<svg class="f-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>`;
 
   head.innerHTML = `
-    ${isTrash ? "" : `<span class="f-grip" title="Drag to reorder">
+    ${isTrash ? "" : `<span class="f-grip" title="${esc(i18nT("folder.dragToReorder"))}">
       <svg viewBox="0 0 24 24" width="10" height="10" fill="currentColor" aria-hidden="true">
         <circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/>
         <circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/>
@@ -1074,13 +1463,13 @@ function renderFolder(folder) {
     <span class="f-name">${esc(folder.name)}</span>
     <span class="f-count">${folder.items.length}</span>
     ${isTrash ? "" : `
-      <button class="f-subfolder" type="button" aria-label="New subfolder" title="New subfolder">
+      <button class="f-subfolder" type="button" aria-label="${esc(i18nT("folder.newSubfolder"))}" title="${esc(i18nT("folder.newSubfolder"))}">
         <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
           <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
           <path d="M12 11v6M9 14h6"/>
         </svg>
       </button>
-      ${isUnsorted ? "" : `<button class="f-del" type="button" aria-label="Delete folder" title="Delete folder">
+      ${isUnsorted ? "" : `<button class="f-del" type="button" aria-label="${esc(i18nT("folder.deleteFolder"))}" title="${esc(i18nT("folder.deleteFolder"))}">
         <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg>
       </button>`}
     `}
@@ -1250,10 +1639,12 @@ function render() {
   const trashIds = new Set(trash?.items || []);
   const isTrashView = catalogView === "trash";
   const isFavoritesView = catalogView === "favorites";
-  const isLibraryView = !isTrashView && !isFavoritesView;
+  const isQueueView = catalogView === "queue";
+  const isLibraryView = !isTrashView && !isFavoritesView && !isQueueView;
 
   catalog?.classList.toggle("trash-view", isTrashView);
   catalog?.classList.toggle("favorites-view", isFavoritesView);
+  catalog?.classList.toggle("queue-view", isQueueView);
 
   document.querySelector(".rail-library")?.classList.toggle("active", isLibraryView);
   document.querySelector(".rail-library")?.setAttribute("aria-pressed", String(isLibraryView));
@@ -1261,9 +1652,25 @@ function render() {
   document.querySelector(".rail-favorites")?.setAttribute("aria-pressed", String(isFavoritesView));
   document.querySelector(".rail-trash")?.classList.toggle("active", isTrashView);
   document.querySelector(".rail-trash")?.setAttribute("aria-pressed", String(isTrashView));
+  document.querySelector(".rail-queue")?.classList.toggle("active", isQueueView);
+  document.querySelector(".rail-queue")?.setAttribute("aria-pressed", String(isQueueView));
 
   if (searchInput) {
-    searchInput.placeholder = isTrashView ? "Search trash…" : isFavoritesView ? "Search favorites…" : "Search library…";
+    searchInput.placeholder = isTrashView
+      ? i18nT("search.placeholderTrash")
+      : isFavoritesView
+        ? i18nT("search.placeholderFavorites")
+        : i18nT("search.placeholderLibrary");
+  }
+
+  // ── Queue view ──
+  // Rendered from the queue snapshot, not the library: it shows what the
+  // backend is actually working on, in the order it will work on it.
+  if (isQueueView) {
+    renderQueueList(list);
+    renderStrip(strip, folders.filter((f) => f.id !== TRASH_ID && !f.parentId));
+    updateQueueBadge();
+    return;
   }
 
   const nonTrash = folders.filter((f) => f.id !== TRASH_ID && !f.parentId);
@@ -1272,9 +1679,9 @@ function render() {
   if (isTrashView) {
     const visibleTrashItems = (trash?.items || []).filter((id) => trackMatchesSearch(tracks[id]));
     if (!trash?.items.length) {
-      list.innerHTML = '<span class="folder-empty trash-empty">Trash is empty</span>';
+      list.innerHTML = `<span class="folder-empty trash-empty">${esc(i18nT("trash.isEmptyState"))}</span>`;
     } else if (visibleTrashItems.length === 0) {
-      list.innerHTML = '<span class="folder-empty trash-empty">No deleted tracks match your search</span>';
+      list.innerHTML = `<span class="folder-empty trash-empty">${esc(i18nT("trash.noSearchMatch"))}</span>`;
     } else {
       for (const id of visibleTrashItems) {
         const item = renderTrackItem(id, { inTrash: true });
@@ -1291,7 +1698,7 @@ function render() {
       .sort(([, a], [, b]) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
       .map(([id]) => id);
     if (!favIds.length) {
-      list.innerHTML = `<span class="folder-empty trash-empty">${catalogSearchQuery ? "No favorites match your search" : "No favorites yet — click ♥ on a track to save it"}</span>`;
+      list.innerHTML = `<span class="folder-empty trash-empty">${esc(catalogSearchQuery ? i18nT("favorites.noSearchMatch") : i18nT("favorites.empty"))}</span>`;
     } else {
       for (const id of favIds) {
         const item = renderRecentItem(id);
@@ -1302,27 +1709,22 @@ function render() {
     return;
   }
 
-  // ── Library view — Recent · Stem Collections · Tags ──
-
-  // Recent section
-  const recentIds = getRecentTracks(trashIds).filter((id) => trackMatchesSearch(tracks[id]));
-  if (recentIds.length) {
-    const section = makeSectionEl("Recent");
-    for (const id of recentIds) {
-      const item = renderRecentItem(id);
-      if (item) section.appendChild(item);
-    }
-    list.appendChild(section);
-  }
+  // ── Library view — Stem Collections · Tags ──
+  //
+  // There was a Recent section above the folders: the three newest tracks,
+  // every one of which is also in its folder, where a new import already lands
+  // at the top. It showed the same track twice for no gain, and with two
+  // imports of one song, four times in one panel (#656). Tracks still being
+  // processed show that in their own row, which is the useful part of it.
 
   // Stem Collections section
-  const collectionsSection = makeSectionEl("Stem Collections");
+  const collectionsSection = makeSectionEl(i18nT("library.stemCollections"));
   const newFolderBtn = document.createElement("button");
   newFolderBtn.id = "newFolderBtn";
   newFolderBtn.className = "new-folder-btn";
   newFolderBtn.type = "button";
-  newFolderBtn.setAttribute("aria-label", "New folder");
-  newFolderBtn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v6 M9 14h6"/></svg>New folder`;
+  newFolderBtn.setAttribute("aria-label", i18nT("library.newFolder"));
+  newFolderBtn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v6 M9 14h6"/></svg>${esc(i18nT("library.newFolder"))}`;
   newFolderBtn.addEventListener("click", createFolder);
   collectionsSection.querySelector(".lib-section-head").appendChild(newFolderBtn);
   let hasCollections = false;
@@ -1335,15 +1737,15 @@ function render() {
   if (hasCollections) list.appendChild(collectionsSection);
 
   // Empty state when search yields nothing
-  if (catalogSearchQuery && !recentIds.length && !hasCollections) {
-    list.innerHTML = '<span class="folder-empty trash-empty">No tracks match your search</span>';
+  if (catalogSearchQuery && !hasCollections) {
+    list.innerHTML = `<span class="folder-empty trash-empty">${esc(i18nT("library.noSearchMatch"))}</span>`;
     return;
   }
 
   // Tags section
   const tags = getAllTags(trashIds);
   if (tags.length) {
-    const section = makeSectionEl("Tags");
+    const section = makeSectionEl(i18nT("library.tags"));
     const row = document.createElement("div");
     row.className = "lib-tags-row";
     const activeTag = catalogSearchQuery.startsWith("#") ? catalogSearchQuery.slice(1) : null;
@@ -1375,9 +1777,393 @@ function render() {
   }
 
   renderStrip(strip, nonTrash);
+  updateQueueBadge();
+  applyQueueDecorations();
+}
+
+// ─── Import queue decoration ───
+//
+// Rows are patched in place rather than re-rendered. The queue stream delivers
+// a frame several times a second, and a full render() rebuilds the whole
+// sidebar and re-runs every drag/click wiring -- at that rate it would fight
+// the user for the DOM. render() calls this once at the end so a genuine
+// rebuild picks the decoration back up.
+
+function progressBarHtml() {
+  return '<div class="cat-progress"><div class="cat-progress-fill"></div></div>';
+}
+
+function decorateRow(el, rowState) {
+  const sub = el.querySelector(".cat-sub");
+  if (!sub) return;
+
+  if (!rowState) {
+    // Left the queue (finished, failed or cancelled). render() will have
+    // rebuilt the row from the library entry, so just drop the decoration.
+    el.classList.remove("in-queue", "queue-waiting", "queue-running");
+    el.querySelector(".cat-progress")?.remove();
+    if (el.dataset.subRestore) {
+      sub.innerHTML = el.dataset.subRestore;
+      delete el.dataset.subRestore;
+    }
+    return;
+  }
+
+  const waiting = rowState.state === "waiting";
+  el.classList.add("in-queue");
+  el.classList.toggle("queue-waiting", waiting);
+  el.classList.toggle("queue-running", !waiting);
+
+  // Keep the original sub line so it can come back if this row is still on
+  // screen when the job leaves the queue.
+  if (!el.dataset.subRestore) el.dataset.subRestore = sub.innerHTML;
+  const label = `<span class="cat-queue-label">${esc(rowState.label)}</span>`;
+  if (sub.innerHTML !== label) sub.innerHTML = label;
+
+  let bar = el.querySelector(".cat-progress");
+  if (waiting) {
+    bar?.remove();
+    return;
+  }
+  if (!bar) {
+    sub.insertAdjacentHTML("afterend", progressBarHtml());
+    bar = el.querySelector(".cat-progress");
+  }
+  const fill = bar?.querySelector(".cat-progress-fill");
+  if (fill) fill.style.width = `${Math.round(rowState.progress * 100)}%`;
+}
+
+/** A background import has finished (or failed, or was cancelled). It has no
+ *  per-job stream, so fetch its final state once and complete its library entry
+ *  -- stems, duration and analysis all land here, which is what makes the track
+ *  playable from the sidebar without a page reload. */
+async function completeSettledJob(jobId) {
+  const existing = tracks[jobId];
+  if (!existing) return; // not ours (or already deleted)
+  try {
+    const res = await fetch(`/api/jobs/${jobId}`, { cache: "no-store" });
+    if (!res.ok) {
+      // 404 means the job is gone from the backend entirely.
+      if (res.status === 404) updateTrackStatus(jobId, "unavailable");
+      return;
+    }
+    const state = await res.json();
+    if (state.status === "cancelled") {
+      // Nothing was produced; drop the placeholder row rather than leaving a
+      // track that can never be loaded.
+      delete tracks[jobId];
+      removeTrackFromFolders(jobId);
+      saveState();
+      render();
+      return;
+    }
+    // A background job that failed used to say nothing at all: no banner (that
+    // belongs to the foreground import), no queue UI, just a console warning
+    // and a library row indistinguishable from a healthy one. Queue three
+    // tracks, lose one, never find out. It gets a notification like any other
+    // failure now.
+    if (state.status === "error") {
+      notifyFailure({
+        kind: "import",
+        message: state.error || i18nT("job.audioProcessingFailed"),
+        detail: state.error_detail || null,
+        context: {
+          jobId,
+          stage: state.stage,
+          device: state.compute_device,
+          gpuFallback: state.gpu_fallback,
+          timings: state.stage_timings ? JSON.stringify(state.stage_timings) : null,
+        },
+      });
+    }
+
+    // Background jobs have no per-job stream (see the comment above), so this
+    // is the only place a background import's on-demand vocal split (#275)
+    // can be triggered -- runVocalSplitIfWanted no-ops if it wasn't requested.
+    const finalState = state.status === "done" ? await runVocalSplitIfWanted(state) : state;
+    const track = stateMetadataToTrack(finalState, { ...existing, id: jobId });
+    track.id = jobId;
+    addTrackToLibrary(track);
+  } catch (e) {
+    console.warn("[catalog] could not finish background job", jobId, e);
+  }
+}
+
+// ─── Queue view ───
+
+function queueEntries(snap) {
+  const entries = [];
+  if (snap.running) entries.push({ job: snap.running, running: true });
+  for (const job of snap.queued ?? []) entries.push({ job, running: false });
+  return entries;
+}
+
+function queueRowHtml({ job, running }, place, { paused = false } = {}) {
+  const track = tracks[job.job_id];
+  const label = running ? runningLabel(job) : paused ? i18nT("queue.pausedStatus") : i18nT("queue.positionInLine", { position: place });
+  const thumb = track ? thumbHtml(track) : thumbHtml({ thumb: job.thumbnail });
+  // The running job cannot be reordered -- it is already running. Only waiting
+  // rows drag, and only they offer "play next".
+  const handle = running
+    ? ""
+    : `<span class="queue-grip" title="Drag to reorder" aria-hidden="true">
+         <svg viewBox="0 0 24 24" width="10" height="10" fill="currentColor">
+           <circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/>
+           <circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/>
+           <circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/>
+         </svg>
+       </span>`;
+  return `
+    <div class="cat-item queue-row ${running ? "queue-running" : "queue-waiting"}" data-id="${esc(job.job_id)}"${running ? "" : ' draggable="true"'}>
+      ${handle}
+      <div class="cat-thumb">${thumb}</div>
+      <div class="cat-meta">
+        <div class="cat-title">${esc(displayTitle(job.title || track?.title || job.source_url))}</div>
+        <div class="cat-sub"><span class="cat-queue-label">${esc(label)}</span></div>
+        ${running ? '<div class="cat-progress"><div class="cat-progress-fill"></div></div>' : ""}
+      </div>
+      ${running || place <= 2 ? "" : `<button class="queue-top" type="button" title="${esc(i18nT("queue.extractNext"))}"
+              aria-label="${esc(i18nT("queue.moveToFront", { title: displayTitle(job.title || job.source_url) }))}">
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+          <path d="M12 19V5 M5 12l7-7 7 7"></path>
+        </svg>
+      </button>`}
+      <button class="queue-cancel" type="button" title="${esc(i18nT("queue.cancelImport"))}"
+              aria-label="${esc(i18nT("queue.cancelImportOf", { title: displayTitle(job.title || job.source_url) }))}">
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+          <path d="M18 6 6 18 M6 6l12 12"></path>
+        </svg>
+      </button>
+    </div>`;
+}
+
+// True while the user is dragging a queue row. Incoming queue frames arrive
+// several times a second; re-rendering the list mid-drag would pull the row out
+// from under the cursor and cancel the drag.
+let _queueDragId = null;
+
+export function isQueueDragging() {
+  return _queueDragId !== null;
+}
+
+/** The id the dragged row should sit after, given where it was dropped.
+ *  Null means the front of the queue. */
+function dropAnchorId(listEl, draggedId, clientY) {
+  const rows = [...listEl.querySelectorAll(".queue-row")].filter(
+    (r) => r.dataset.id !== draggedId,
+  );
+  let anchor = null;
+  for (const row of rows) {
+    const box = row.getBoundingClientRect();
+    if (clientY > box.top + box.height / 2) anchor = row.dataset.id;
+  }
+  return anchor;
+}
+
+function wireQueueRow(el, listEl) {
+  el.querySelector(".queue-cancel")?.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    await cancelQueuedJob(el.dataset.id);
+  });
+
+  el.querySelector(".queue-top")?.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    e.currentTarget.disabled = true;
+    await reorderQueuedJob(el.dataset.id, null);
+  });
+
+  if (el.getAttribute("draggable") !== "true") return;
+
+  el.addEventListener("dragstart", (e) => {
+    _queueDragId = el.dataset.id;
+    el.classList.add("dragging");
+    e.dataTransfer.effectAllowed = "move";
+    // Firefox refuses to start a drag without payload.
+    e.dataTransfer.setData("text/plain", el.dataset.id);
+  });
+
+  el.addEventListener("dragend", () => {
+    _queueDragId = null;
+    el.classList.remove("dragging");
+    for (const r of listEl.querySelectorAll(".queue-row")) r.classList.remove("drop-below");
+  });
+}
+
+function wireQueueListDrop(listEl) {
+  listEl.addEventListener("dragover", (e) => {
+    if (!_queueDragId) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    const anchor = dropAnchorId(listEl, _queueDragId, e.clientY);
+    for (const r of listEl.querySelectorAll(".queue-row")) {
+      r.classList.toggle("drop-below", !!anchor && r.dataset.id === anchor);
+    }
+  });
+
+  listEl.addEventListener("drop", async (e) => {
+    if (!_queueDragId) return;
+    e.preventDefault();
+    const dragged = _queueDragId;
+    const anchor = dropAnchorId(listEl, dragged, e.clientY);
+    _queueDragId = null;
+    for (const r of listEl.querySelectorAll(".queue-row")) r.classList.remove("drop-below");
+    if (anchor !== dragged) await reorderQueuedJob(dragged, anchor);
+  });
+}
+
+function queuePausedBannerHtml(count) {
+  return `
+    <div class="queue-paused-banner">
+      <div class="queue-paused-text">
+        ${i18nPlural("queue.paused", count)}
+      </div>
+      <button class="queue-start-btn" type="button">${i18nT("queue.start")}</button>
+    </div>`;
+}
+
+function renderQueueList(listEl, snap = getQueueSnapshot()) {
+  const entries = queueEntries(snap);
+  listEl.innerHTML = "";
+
+  const section = document.createElement("div");
+  section.className = "lib-section queue-section";
+  section.innerHTML = `<div class="lib-section-head"><span>${esc(i18nT("queue.importQueue"))}</span></div>`;
+
+  if (isPaused(snap)) {
+    section.insertAdjacentHTML("beforeend", queuePausedBannerHtml(entries.length));
+    section.querySelector(".queue-start-btn")?.addEventListener("click", async (e) => {
+      e.currentTarget.disabled = true;
+      e.currentTarget.textContent = i18nT("queue.starting");
+      await startQueue();
+    });
+  }
+
+  if (!entries.length) {
+    section.insertAdjacentHTML(
+      "beforeend",
+      '<span class="folder-empty trash-empty">Nothing importing. Queued tracks appear here.</span>',
+    );
+    listEl.appendChild(section);
+    return;
+  }
+
+  const paused = isPaused(snap);
+  section.insertAdjacentHTML(
+    "beforeend",
+    entries.map((entry, i) => queueRowHtml(entry, i + 1, { paused })).join(""),
+  );
+  listEl.appendChild(section);
+  for (const el of section.querySelectorAll(".queue-row")) wireQueueRow(el, listEl);
+  wireQueueListDrop(listEl);
+  updateQueueRows(snap);
+}
+
+/** Patch the open queue view in place. Only a change to which jobs are present
+ *  (or their order) costs a rebuild; progress and stage text are written
+ *  straight to the existing nodes, because this runs several times a second. */
+function updateQueueRows(snap = getQueueSnapshot()) {
+  const listEl = document.getElementById("catalogList");
+  if (!listEl || catalogView !== "queue") return;
+  // A frame landing mid-drag would rebuild the list and yank the row out
+  // from under the cursor.
+  if (isQueueDragging()) return;
+
+  const entries = queueEntries(snap);
+  const shown = [...listEl.querySelectorAll(".queue-row")].map((el) => el.dataset.id);
+  const wanted = entries.map((e) => e.job.job_id);
+  const bannerShown = !!listEl.querySelector(".queue-paused-banner");
+  if (
+    shown.length !== wanted.length ||
+    shown.some((id, i) => id !== wanted[i]) ||
+    bannerShown !== isPaused(snap)
+  ) {
+    renderQueueList(listEl, snap);
+    return;
+  }
+
+  entries.forEach((entry, i) => {
+    const el = listEl.querySelector(`.queue-row[data-id="${entry.job.job_id}"]`);
+    if (!el) return;
+    const label = entry.running
+      ? runningLabel(entry.job)
+      : isPaused(snap)
+        ? i18nT("queue.pausedStatus")
+        : i18nT("queue.positionInLine", { position: i + 1 });
+    const labelEl = el.querySelector(".cat-queue-label");
+    if (labelEl && labelEl.textContent !== label) labelEl.textContent = label;
+    const fill = el.querySelector(".cat-progress-fill");
+    if (fill) fill.style.width = `${Math.round((entry.job.progress || 0) * 100)}%`;
+  });
+}
+
+/** The rail button only exists while there is something to look at, and carries
+ *  the count so the queue is legible without opening it. */
+function updateQueueBadge(snap = getQueueSnapshot()) {
+  const btn = document.querySelector(".rail-queue");
+  const badge = document.getElementById("queueBadge");
+  if (!btn) return;
+  const count = queueCount(snap);
+  btn.classList.toggle("hidden", count === 0 && catalogView !== "queue");
+  if (badge) {
+    badge.textContent = count > 99 ? "99+" : String(count);
+    badge.classList.toggle("hidden", count === 0);
+  }
+}
+
+function onQueueFrame(snap) {
+  updateQueueBadge(snap);
+  if (catalogView !== "queue") {
+    applyQueueDecorations(snap);
+    return;
+  }
+  if (queueCount(snap) === 0) {
+    // Nothing left to manage. Fall back to the library rather than leaving the
+    // user in a view that can only ever be empty from here. Deliberately not
+    // done inside updateQueueBadge, which render() calls -- that would recurse.
+    setCatalogView("library");
+    return;
+  }
+  updateQueueRows(snap);
+}
+
+function applyQueueDecorations(snap = getQueueSnapshot()) {
+  const states = queueRowStates(snap);
+  for (const el of document.querySelectorAll(".cat-item[data-id]")) {
+    const state = states.get(el.dataset.id);
+    // Only touch rows that are, or just were, in the queue.
+    if (!state && !el.classList.contains("in-queue")) continue;
+    decorateRow(el, state);
+  }
 }
 
 // ─── Catalog panel collapse ───
+
+/** Collapse or restore the library sidebar.
+ *
+ *  Exported because the "All" panel toggle puts the library away along with
+ *  the three panels around the mixer. The state is one class on .app plus one
+ *  localStorage flag, and a second writer reproducing those by hand is exactly
+ *  the kind of pair that drifts the first time either changes.
+ */
+export function setSidebarCollapsed(isCollapsed) {
+  const app = document.querySelector(".app");
+  if (!app) return;
+  app.classList.toggle("cat-collapsed", isCollapsed);
+  document
+    .getElementById("sidebarCollapseBtn")
+    ?.setAttribute("aria-expanded", String(!isCollapsed));
+  try {
+    localStorage.setItem("stemdeck.catalog.collapsed", isCollapsed ? "1" : "0");
+  } catch (e) {
+    console.warn("[catalog] could not persist sidebar state:", e);
+  }
+}
+
+export function isSidebarCollapsed() {
+  return !!document.querySelector(".app")?.classList.contains("cat-collapsed");
+}
 
 function wireCatalogToggle() {
   const toggle = document.getElementById("catalogToggle");
@@ -1389,12 +2175,6 @@ function wireCatalogToggle() {
   if (collapsed) {
     app.classList.add("cat-collapsed");
     collapseBtn?.setAttribute("aria-expanded", "false");
-  }
-
-  function setSidebarCollapsed(isCollapsed) {
-    app.classList.toggle("cat-collapsed", isCollapsed);
-    collapseBtn?.setAttribute("aria-expanded", String(!isCollapsed));
-    localStorage.setItem("stemdeck.catalog.collapsed", isCollapsed ? "1" : "0");
   }
 
   collapseBtn?.addEventListener("click", () => {
@@ -1418,15 +2198,44 @@ function wireCatalogRailViews() {
   document.querySelector(".rail-library")?.addEventListener("click", () => setCatalogView("library"));
   document.querySelector(".rail-favorites")?.addEventListener("click", () => setCatalogView("favorites"));
   document.querySelector(".rail-trash")?.addEventListener("click", () => setCatalogView("trash"));
-  document.getElementById("clearBinBtn")?.addEventListener("click", () => {
-    const trash = getTrashFolder();
-    const toDelete = [...(trash?.items || [])];
-    markJobsDeleted(toDelete); // persist before purge so reload can't re-import
-    purgeTrash();
-    saveState();
-    render();
-    for (const id of toDelete) {
-      fetch(`/api/jobs/${id}`, { method: "DELETE" }).catch(() => {});
+  document.querySelector(".rail-queue")?.addEventListener("click", () => setCatalogView("queue"));
+  document.getElementById("clearBinBtn")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      const trash = getTrashFolder();
+      const toDelete = [...(trash?.items || [])];
+      // Awaited: the tombstone has to be on disk before the tracks leave the
+      // local index, or a reload re-imports them (#521).
+      await markJobsDeleted(toDelete);
+      purgeTrash();
+      saveState();
+      render();
+
+      // Awaited too. These used to be fire-and-forget with .catch(() => {}),
+      // so a delete that failed -- a 409 on a job stuck in "queued", a 500
+      // when the files could not be removed -- was invisible, and the track
+      // came back the next time the registry was read from disk.
+      const failed = [];
+      for (const id of toDelete) {
+        try {
+          const res = await fetch(`/api/jobs/${id}`, { method: "DELETE" });
+          if (!res.ok && res.status !== 404) failed.push(id);
+        } catch (err) {
+          console.warn("[catalog] delete failed for", id, err);
+          failed.push(id);
+        }
+      }
+      if (failed.length) {
+        console.warn("[catalog] %d track(s) could not be deleted on the server", failed.length);
+        notifyFailure({
+          kind: "delete",
+          message: i18nT("library.deleteFailed", { count: failed.length }),
+        });
+      }
+    } finally {
+      btn.disabled = false;
     }
   });
 }
@@ -1528,7 +2337,27 @@ const FALLBACK_VERSION = "0.1.0";
 let currentVersion = FALLBACK_VERSION;
 const REPO_URL = "https://github.com/stemdeckapp/stemdeck";
 const RELEASES_URL = "https://github.com/stemdeckapp/stemdeck/releases";
-const RELEASES_API = "https://api.github.com/repos/stemdeckapp/stemdeck/releases/latest";
+// The releases LIST, not /releases/latest. GitHub defines "latest" as the most
+// recent NON-PRERELEASE release, so the moment a version ships with the
+// pre-release box ticked it becomes invisible here and nobody is ever told an
+// update exists. StemDeck has historically published even its alphas as normal
+// releases, which is why that has not bitten yet -- this makes the check
+// correct either way rather than dependent on remembering not to tick a box.
+// The one release GitHub itself calls latest.
+//
+// Not the list endpoint. A release can be published in three states, and the
+// list only distinguishes two of them: "set as the latest release", "set as a
+// pre-release", and neither. That third state comes back as
+// `draft: false, prerelease: false`, indistinguishable from a promoted release
+// by any field the list carries, so filtering it was offering every user a
+// build that was deliberately not promoted (#666).
+//
+// This endpoint answers the question directly: it returns the release marked
+// latest and nothing else, and excludes drafts and pre-releases by definition.
+// It also 404s while every release is a pre-release, which is the correct
+// answer to "is there an update" at that moment.
+const RELEASES_API =
+  "https://api.github.com/repos/stemdeckapp/stemdeck/releases/latest";
 const DISMISSED_UPDATE_KEY = "stemdeck.dismissed_update";
 
 // The full GitHub release object from the last successful update check, used to
@@ -1562,13 +2391,29 @@ function setDisplayedVersion(version) {
   if (about) about.textContent = `v${currentVersion}`;
 }
 
+// Kept from the health check so a bug report can state the running version,
+// model and ffmpeg status without a second round trip.
+let healthInfo = {};
+
 async function loadCurrentVersion() {
   try {
     const res = await fetch("/api/health", { cache: "no-store" });
     if (!res.ok) return;
     const data = await res.json();
+    healthInfo = data;
     setDisplayedVersion(data.version);
   } catch (e) { console.warn("[catalog] version fetch failed:", e); }
+}
+
+/** Everything a bug report needs about this install. */
+export async function collectDiagnostics() {
+  return {
+    version: currentVersion,
+    model: healthInfo.demucs_model,
+    ffmpegConfigured: healthInfo.ffmpeg_configured,
+    buildTarget: await getBuildTarget(),
+    isDesktop: Boolean(window.__TAURI__?.core?.invoke),
+  };
 }
 
 function escapeHtml(value) {
@@ -1680,7 +2525,7 @@ function renderReleaseNotes(markdown) {
 // Resolve the running build's OS/arch/GPU variant. On desktop this is exact
 // (Rust build_target); on web/server there is no reliable signal, so guess the
 // OS from the user agent and leave the variant as CPU.
-async function getBuildTarget() {
+export async function getBuildTarget() {
   if (cachedBuildTarget) return cachedBuildTarget;
   const invoke = window.__TAURI__?.core?.invoke;
   if (invoke) {
@@ -1718,6 +2563,153 @@ function pickReleaseAsset(release, target) {
   return asset ? { url: asset.browser_download_url, name } : null;
 }
 
+// ─── In-app updater ───
+// Downloads and applies an update without leaving the app, instead of sending
+// the user to a browser download -- see download_app_update/apply_app_update in
+// desktop/src-tauri/src/main.rs for the file swap.
+//
+// Windows and Linux only. Both ship a flat directory with the executable,
+// backend/ and python/ side by side, which is the shape the swap needs. macOS
+// resolves its backend inside the downloaded runtime pack rather than the .app,
+// so its app layer is a different thing entirely and is handled separately.
+//
+// The updater replaces the executable and backend/ ONLY. It never touches
+// python/, because an NVIDIA install rewrites that directory with CUDA torch on
+// first run and replacing it would silently drop the machine back to CPU. So an
+// in-app update is only safe when the release needs the same Python
+// dependencies the install already has -- that is what the runtime id gates.
+// When it doesn't match, we fall back to the normal full-package download.
+
+function findReleaseAsset(release, name) {
+  return (release.assets || []).find((a) => a.name === name) || null;
+}
+
+// Asset names the packaging scripts publish for each in-place-updatable
+// platform. The archive format differs because each script already produces
+// one: Compress-Archive on Windows, tar on Linux (which also preserves the
+// executable bit the relaunch depends on).
+function updaterAssetNames(target) {
+  if (target.os === "windows") {
+    return { app: "StemDeck-Windows-x64-app.zip", runtimeId: "StemDeck-Windows-x64-runtime-version.json" };
+  }
+  if (target.os === "linux") {
+    return { app: "StemDeck-Linux-x64-app.tar.gz", runtimeId: "StemDeck-Linux-x64-runtime-version.json" };
+  }
+  return null;
+}
+
+// Resolves the app-layer asset for the in-app updater, or null when this
+// release cannot be applied in place -- it predates the updater assets, is
+// missing one, or changed the Python dependency set. Null means "use the full
+// download link", which is always correct, just less convenient.
+//
+// The checksum and runtime-id files are read by Rust (`check_app_update`), not
+// fetched here. This page is served by the Python backend, so its CSP applies,
+// and connect-src allows api.github.com but NOT the github.com /
+// objects.githubusercontent.com hosts that serve release *assets*. Fetching
+// them from JS is blocked outright; Rust's HTTP client is not bound by the page
+// CSP, so the policy stays as tight as it is today.
+async function resolveInAppUpdatePlan(release, target) {
+  const names = updaterAssetNames(target);
+  if (!names) return null;
+  const appAsset = findReleaseAsset(release, names.app);
+  const appShaAsset = findReleaseAsset(release, `${names.app}.sha256`);
+  const runtimeIdAsset = findReleaseAsset(release, names.runtimeId);
+  if (!appAsset || !appShaAsset || !runtimeIdAsset) return null;
+
+  const check = await window.__TAURI__.core.invoke("check_app_update", {
+    query: {
+      appShaUrl: appShaAsset.browser_download_url,
+      runtimeIdUrl: runtimeIdAsset.browser_download_url,
+    },
+  });
+  if (!check?.supported) {
+    console.info("[catalog] in-app update unavailable:", check?.reason || "unknown");
+    return null;
+  }
+
+  return { appUrl: appAsset.browser_download_url, appSha256: check.appSha256 };
+}
+
+function showInappError(message) {
+  const errorEl = document.getElementById("releaseInappError");
+  if (!errorEl) return;
+  errorEl.textContent = `${i18nT("release.updateFailed")}: ${message}`;
+  errorEl.classList.remove("hidden");
+}
+
+// Wires the download/apply buttons for a resolved plan. Returns false (and
+// touches nothing) when this release has no in-app-updatable assets, so the
+// caller can fall back to the plain download link.
+async function wireInAppUpdate(target) {
+  const downloadBtn = document.getElementById("releaseDownloadApp");
+  const applyBtn = document.getElementById("releaseApplyUpdate");
+  const inapp = document.getElementById("releaseInapp");
+  const progress = document.getElementById("releaseInappProgress");
+  const progressText = document.getElementById("releaseInappProgressText");
+  const errorEl = document.getElementById("releaseInappError");
+  if (!downloadBtn || !applyBtn || !latestRelease) return false;
+
+  const plan = await resolveInAppUpdatePlan(latestRelease, target);
+  if (!plan) return false;
+
+  // The manual download stays visible alongside the auto-update pill: some
+  // people would rather grab the zip, and it is the escape hatch if an in-app
+  // update fails.
+  inapp?.classList.remove("hidden");
+  progress?.classList.add("hidden");
+  errorEl?.classList.add("hidden");
+  downloadBtn.disabled = false;
+  applyBtn.disabled = false;
+  downloadBtn.classList.remove("hidden");
+  applyBtn.classList.add("hidden");
+
+  // Indeterminate, not a byte-accurate bar. Real progress would mean listening
+  // to the Rust download event, and this page is served over http by the Python
+  // backend -- a remote origin, which the Tauri capability in
+  // desktop/src-tauri/capabilities/default.json does not cover, so
+  // `plugin:event|listen` is refused by the ACL. Granting a remote origin event
+  // permissions would widen exactly the IPC surface #171 locked down, and the
+  // app layer is ~5 MB. Not worth it. (App-defined commands like the invokes
+  // below are not ACL-gated, which is why those work.)
+  downloadBtn.onclick = async () => {
+    errorEl?.classList.add("hidden");
+    downloadBtn.disabled = true;
+    if (progressText) progressText.textContent = i18nT("release.downloading");
+    progress?.classList.remove("hidden");
+    progress?.classList.add("indeterminate");
+    try {
+      await window.__TAURI__.core.invoke("download_app_update", { plan });
+      progress?.classList.add("hidden");
+      downloadBtn.classList.add("hidden");
+      applyBtn.classList.remove("hidden");
+    } catch (e) {
+      console.warn("[catalog] download_app_update failed:", e);
+      showInappError(String(e?.message || e));
+      downloadBtn.disabled = false;
+      progress?.classList.add("hidden");
+    }
+  };
+
+  applyBtn.onclick = async () => {
+    errorEl?.classList.add("hidden");
+    applyBtn.disabled = true;
+    if (progressText) progressText.textContent = i18nT("release.applying");
+    progress?.classList.remove("hidden");
+    try {
+      // On success the app exits and relaunches -- this promise never resolves.
+      await window.__TAURI__.core.invoke("apply_app_update");
+    } catch (e) {
+      console.warn("[catalog] apply_app_update failed:", e);
+      showInappError(String(e?.message || e));
+      applyBtn.disabled = false;
+      progress?.classList.add("hidden");
+    }
+  };
+
+  return true;
+}
+
 async function openReleaseDialog() {
   const dialog = document.getElementById("releaseDialog");
   if (!dialog || !latestRelease) return;
@@ -1747,17 +2739,35 @@ async function openReleaseDialog() {
   } else if (download) {
     docker?.classList.add("hidden");
     const target = await getBuildTarget();
+
+    // The manual download is always offered. On Windows, when the release can
+    // be applied in place, an "Update now" pill appears beside it -- additive,
+    // never a replacement, so the zip stays one click away either way.
     const picked = pickReleaseAsset(latestRelease, target);
     if (picked) {
       download.href = picked.url;
-      download.textContent = "Download";
+      download.textContent = i18nT("release.download");
     } else {
       // No matching asset (e.g. an arch we don't build): fall back to the
       // release page so the user can pick manually.
       download.href = latestRelease.html_url || RELEASES_URL;
-      download.textContent = "View download";
+      download.textContent = i18nT("release.viewDownload");
     }
     download.classList.remove("hidden");
+
+    let usedInapp = false;
+    if (updaterAssetNames(target)) {
+      try {
+        usedInapp = await wireInAppUpdate(target);
+      } catch (e) {
+        console.warn("[catalog] in-app update setup failed, falling back to link:", e);
+      }
+    }
+    if (!usedInapp) {
+      document.getElementById("releaseInapp")?.classList.add("hidden");
+      document.getElementById("releaseDownloadApp")?.classList.add("hidden");
+      document.getElementById("releaseApplyUpdate")?.classList.add("hidden");
+    }
   }
 
   dialog.classList.remove("hidden");
@@ -1781,7 +2791,15 @@ async function checkForUpdate() {
   try {
     const res = await fetch(RELEASES_API, { headers: { Accept: "application/vnd.github+json" } });
     if (!res.ok) return;
+    // The check itself succeeded, regardless of what it finds below — clear
+    // any stale "update check failed" card (#401).
+    dismissFailuresByKind("update");
+    // One release, already chosen by the endpoint. The two checks are belt and
+    // braces rather than the decision: this endpoint is documented to exclude
+    // drafts and pre-releases, and if that ever stops being true the app should
+    // stay quiet rather than inherit the change.
     const data = await res.json();
+    if (!data || data.draft || data.prerelease || !data.tag_name) return;
     const latest = normalizeVersion(data.tag_name);
     // Compare canonically so a PEP440 current version (0.7.0a9) matches the
     // release tag form (0.7.0-alpha.9) and we don't nag an already-current app.
@@ -1799,14 +2817,13 @@ async function checkForUpdate() {
 
     const card = document.getElementById("notifReleaseCard");
     const desc = document.getElementById("notifReleaseDesc");
-    const badge = document.getElementById("notifBadge");
-    const empty = document.getElementById("notifEmpty");
     const dismissBtn = document.getElementById("notifReleaseDismiss");
 
     if (desc) desc.textContent = `v${latest}`;
     card?.classList.remove("hidden");
-    badge?.classList.remove("hidden");
-    empty?.classList.add("hidden");
+    // The badge and empty state are shared with failure cards now, so they are
+    // decided in one place from the full set rather than toggled from here.
+    setReleasePending(true);
 
     // Clicking the card (anywhere but the dismiss button) opens the release dialog.
     card?.addEventListener("click", (e) => {
@@ -1818,10 +2835,20 @@ async function checkForUpdate() {
       e.stopPropagation();
       try { localStorage.setItem(DISMISSED_UPDATE_KEY, latest); } catch (e) { console.warn(e); }
       card?.classList.add("hidden");
-      badge?.classList.add("hidden");
-      empty?.classList.remove("hidden");
+      setReleasePending(false);
     }, { once: true });
-  } catch (e) { console.warn("[catalog] update check failed:", e); }
+  } catch (e) {
+    console.warn("[catalog] update check failed:", e);
+    // Only report a genuine failure, not "we are offline": an update check that
+    // cannot reach GitHub is not a StemDeck bug and must not file one.
+    if (!(e instanceof TypeError)) {
+      notifyFailure({
+        kind: "update",
+        message: i18nT("update.checkFailed"),
+        detail: String(e?.message || e),
+      });
+    }
+  }
 }
 
 function wireAboutDialog() {
@@ -1846,9 +2873,82 @@ function wireAboutDialog() {
   });
 }
 
+// The small glyph at the foot of a partner card: the Instagram mark for an
+// Instagram profile, a generic link glyph for anything else.
+function friendGlyph(url) {
+  const instagram = /instagram\.com/i.test(url || "");
+  const svg = document.createElementNS(SVGNS, "svg");
+  svg.setAttribute("class", instagram ? "lib-friend-ig" : "lib-friend-link");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  for (const d of instagram ? [IG_ICON_PATH] : LINK_ICON_PATHS) {
+    const p = document.createElementNS(SVGNS, "path");
+    p.setAttribute("d", d);
+    svg.appendChild(p);
+  }
+  return svg;
+}
+
+// One partner card: image (or initial badge), name, role, link glyph.
+function friendCard(f) {
+  const a = document.createElement("a");
+  a.className = "lib-friend";
+  a.href = f.url;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  a.title = f.name;
+
+  // A monogram badge (first initial) keeps the card on-brand when an entry has
+  // no image, or when its image fails to load (e.g. before the asset is added).
+  const makeMonogram = () => {
+    const m = document.createElement("span");
+    m.className = "lib-friend-monogram";
+    m.textContent = (f.name || "?").trim().charAt(0).toUpperCase();
+    m.setAttribute("aria-hidden", "true");
+    return m;
+  };
+
+  // Fixed-height slot so names line up across a row whichever of the three
+  // shapes (round avatar, wordmark, monogram) an entry ends up with.
+  const media = document.createElement("span");
+  media.className = "lib-friend-media";
+  if (f.logo) {
+    const img = document.createElement("img");
+    img.className = f.avatar ? "lib-friend-avatar" : "lib-friend-logo";
+    img.src = f.logo;
+    img.alt = f.name;
+    img.loading = "lazy";
+    img.addEventListener("error", () => img.replaceWith(makeMonogram()));
+    media.appendChild(img);
+  } else {
+    media.appendChild(makeMonogram());
+  }
+  a.appendChild(media);
+
+  // Partner names are proper nouns and stay as-is; only the role is translated.
+  const name = document.createElement("span");
+  name.className = "lib-friend-name";
+  name.textContent = f.name;
+  a.appendChild(name);
+
+  if (f.roleKey) {
+    const role = document.createElement("span");
+    role.className = "lib-friend-role";
+    // data-i18n lets applyTranslations() re-resolve this on a language switch;
+    // the textContent below is what shows until then.
+    role.setAttribute("data-i18n", f.roleKey);
+    role.textContent = i18nT(f.roleKey);
+    a.appendChild(role);
+  }
+
+  a.appendChild(friendGlyph(f.url));
+  return a;
+}
+
 // Supporters dialog: a TV rail button opens a centered modal (like About) with
-// the partner tiles. Links open externally via the document-level
-// a[target="_blank"] handler in main.js (Tauri open_url on desktop).
+// the partner cards, grouped by category. Links open externally via the
+// document-level a[target="_blank"] handler in main.js (Tauri open_url on
+// desktop).
 function wireSupportersDialog() {
   const btn = document.getElementById("friendsBtn");
   const dialog = document.getElementById("friendsDialog");
@@ -1858,68 +2958,62 @@ function wireSupportersDialog() {
 
   if (grid && grid.dataset.ready !== "1") {
     grid.dataset.ready = "1";
-    // Masonry: round-robin tiles into fixed columns so a tall tile in one
-    // column does not push the next row down. Small per-tile tilt gives the
-    // deliberately-uneven "frames on a wall" look.
-    const COLS = 3;
-    const tilts = ["-2deg", "1.5deg", "-1deg", "2deg", "-1.5deg", "1deg"];
-    const cols = [];
-    for (let i = 0; i < COLS; i++) {
-      const col = document.createElement("div");
-      col.className = "lib-friends-col";
-      cols.push(col);
-      grid.appendChild(col);
+    // Two columns with a rule between them, rather than one long list. Six
+    // sections stacked is taller than the dialog on any normal window, so the
+    // whole thing scrolled and half the people on it were never seen.
+    const columns = [document.createElement("div"), document.createElement("div")];
+    const split = document.createElement("div");
+    split.className = "lib-friends-split";
+    split.setAttribute("aria-hidden", "true");
+    for (const col of columns) col.className = "lib-friends-col";
+    grid.append(columns[0], split, columns[1]);
+
+    // Alphabetical, and sorted here rather than in FRIEND_GROUPS so that
+    // adding someone never means finding the right line to put them on.
+    //
+    // Categories sort on the *translated* label, which is the only order that
+    // reads as alphabetical to the person looking at it -- a fixed order taken
+    // from the English names is arbitrary in the other ten languages. Members
+    // sort on `name`, which is a proper noun and identical everywhere.
+    // localeCompare so accents and case land where a reader expects them
+    // (Dead roses next to Dlima, not after Z).
+    const collator = new Intl.Collator(getLanguage(), { sensitivity: "base", numeric: true });
+    const groups = FRIEND_GROUPS.map((group) => ({
+      ...group,
+      label: i18nT(group.labelKey),
+      members: [...group.members].sort((a, b) => collator.compare(a.name, b.name)),
+    })).sort((a, b) => collator.compare(a.label, b.label));
+
+    // Where to break between the two columns. Counting sections was a fixed
+    // split at three, which only balanced while every category had the same
+    // number of people in it; the moment one grew to two rows of cards, one
+    // side ran past the bottom of the dialog and the other stopped halfway.
+    //
+    // So measure in rows instead: a heading plus however many rows of cards
+    // the category needs, and break wherever the two sides come out closest.
+    const PER_ROW = 4;
+    const HEADING = 0.35; // a heading is roughly a third of a card row
+    const weights = groups.map((g) => HEADING + Math.ceil(g.members.length / PER_ROW));
+    const total = weights.reduce((a, b) => a + b, 0);
+    let best = { at: 1, gap: Infinity };
+    let run = 0;
+    for (let k = 1; k < groups.length; k++) {
+      run += weights[k - 1];
+      const gap = Math.abs(run - (total - run));
+      if (gap < best.gap) best = { at: k, gap };
     }
-    FRIENDS.forEach((f, i) => {
-      const a = document.createElement("a");
-      a.className = "lib-friend";
-      a.href = f.url;
-      a.target = "_blank";
-      a.rel = "noopener noreferrer";
-      a.title = f.name;
-      a.style.setProperty("--tilt", tilts[i % tilts.length]);
-      // A monogram avatar (first initial) keeps the tile on-brand when an entry
-      // has no image, or its image fails to load (e.g. before the asset is added).
-      const makeMonogram = () => {
-        const m = document.createElement("span");
-        m.className = "lib-friend-monogram";
-        m.textContent = (f.name || "?").trim().charAt(0).toUpperCase();
-        m.setAttribute("aria-hidden", "true");
-        return m;
-      };
-      if (f.logo) {
-        const img = document.createElement("img");
-        img.className = f.avatar ? "lib-friend-avatar" : "lib-friend-logo";
-        img.src = f.logo;
-        img.alt = f.name;
-        img.loading = "lazy";
-        img.addEventListener("error", () => img.replaceWith(makeMonogram()));
-        a.appendChild(img);
-      } else {
-        a.appendChild(makeMonogram());
-      }
-      const name = document.createElement("span");
-      name.className = "lib-friend-name";
-      name.textContent = f.name;
-      a.appendChild(name);
-      if (f.role) {
-        const role = document.createElement("span");
-        role.className = "lib-friend-role";
-        role.textContent = f.role;
-        a.appendChild(role);
-      }
-      if (/instagram\.com/i.test(f.url || "")) {
-        const SVGNS = "http://www.w3.org/2000/svg";
-        const ig = document.createElementNS(SVGNS, "svg");
-        ig.setAttribute("class", "lib-friend-ig");
-        ig.setAttribute("viewBox", "0 0 24 24");
-        ig.setAttribute("aria-hidden", "true");
-        const p = document.createElementNS(SVGNS, "path");
-        p.setAttribute("d", IG_ICON_PATH);
-        ig.appendChild(p);
-        a.appendChild(ig);
-      }
-      cols[i % COLS].appendChild(a);
+
+    groups.forEach((group, i) => {
+      const col = columns[i < best.at ? 0 : 1];
+      const label = document.createElement("h3");
+      label.className = "lib-friends-cat";
+      label.setAttribute("data-i18n", group.labelKey);
+      label.textContent = group.label;
+      col.appendChild(label);
+      const row = document.createElement("div");
+      row.className = "lib-friends-row";
+      for (const f of group.members) row.appendChild(friendCard(f));
+      col.appendChild(row);
     });
   }
 
@@ -1931,21 +3025,82 @@ function wireSupportersDialog() {
   dialog.addEventListener("keydown", (e) => { if (e.code === "Escape") hide(); });
 }
 
+// Ground truth for "done" <-> "unavailable" is the server (it checks the
+// stems folder on disk), catching a job whose registry entry survived but
+// whose files did not - something mere presence in `jobs` cannot tell apart
+// from a healthy one. Shared by the passive startup sync and the
+// user-triggered "Resync" button so both apply the same rule.
+function reconcileAvailability(jobs) {
+  const serverIds = new Set(jobs.map((j) => j.job_id));
+  const serverStatus = new Map(jobs.map((j) => [j.job_id, j.status]));
+  const trashIds = new Set(getTrashFolder()?.items || []);
+  for (const [id, t] of Object.entries(tracks)) {
+    if (trashIds.has(id)) continue;
+    if (t.status !== "done" && t.status !== "unavailable") continue;
+    if (serverIds.has(id)) t.status = serverStatus.get(id) === "unavailable" ? "unavailable" : "done";
+    else if (t.status === "done") t.status = "unavailable"; // gone from the registry entirely
+  }
+  saveState();
+  render();
+}
+
+/**
+ * Push this device's Trash up to the server.
+ *
+ * Every install that predates server-side Trash has a local bin the backend
+ * knows nothing about, and those tracks are exactly the ones showing up on the
+ * user's phone. One pass on load fixes them, and it doubles as the retry for
+ * any syncTrashToServer call that failed while offline.
+ *
+ * One-way on purpose. Letting the server's answer win here would mean a failed
+ * restore silently re-binning the track on the next load, and the desktop is
+ * the only client with a Trash to be authoritative about.
+ */
+function reconcileTrashWithServer(jobs, trashIds) {
+  for (const state of jobs) {
+    const shouldBeTrashed = trashIds.has(state.job_id);
+    if (shouldBeTrashed === (state.trashed_at != null)) continue;
+    syncTrashToServer(state.job_id, shouldBeTrashed);
+  }
+}
+
 async function syncWithServer() {
   try {
-    const res = await fetch("/api/jobs", { cache: "no-store" });
+    // trashed=include, because this side keeps its own view of the library and
+    // needs the whole registry to reconcile against. The default list leaves
+    // trashed jobs out -- right for the phone, which has no Trash of its own,
+    // and wrong here: reconcileAvailability would read every one of them as
+    // "gone from the registry" and mark the user's binned tracks unavailable.
+    const res = await fetch("/api/jobs?trashed=include", { cache: "no-store" });
     if (!res.ok) return;
     const jobs = await res.json();
     const trashIds = new Set(getTrashFolder()?.items || []);
     const deletedIds = getDeletedJobIds();
+    reconcileTrashWithServer(jobs, trashIds);
+    let backfilled = false;
     for (const state of jobs) {
-      if (tracks[state.job_id]) continue;
+      const known = tracks[state.job_id];
+      if (known) {
+        // Tracks saved before the server reported a format (#690) only learn
+        // it when they are opened. Taking it from here instead means the
+        // whole library shows its icons at startup.
+        if (!known.sourceFormat && state.source_format) {
+          known.sourceFormat = state.source_format;
+          backfilled = true;
+        }
+        continue;
+      }
       if (trashIds.has(state.job_id)) continue;   // soft-deleted, skip
       if (deletedIds.has(state.job_id)) continue; // hard-deleted, skip
       const track = stateMetadataToTrack(state, { id: state.job_id, status: state.status });
       track.id = state.job_id;
       addTrackToLibrary(track);
     }
+    if (backfilled) {
+      saveState();
+      render();
+    }
+    reconcileAvailability(jobs);
   } catch (e) { console.warn("[catalog] failed to load jobs from backend:", e); }
 }
 
@@ -1954,11 +3109,29 @@ async function syncWithServer() {
 let libraryEditor = null;
 let libraryEditorOnKey = null;
 
+// The settings modal has a lot of server-fetched, dynamically-computed text
+// (resolved device suffix, out-of-sync status, stems-location message, ...)
+// that a generic data-i18n re-apply pass can't safely re-derive after a
+// language switch. Simplest robust fix: if the modal is open when the
+// language changes, just rebuild it from scratch -- openLibraryEditor()
+// already re-fetches everything fresh and is safe to call while already open
+// (it closes any existing instance first).
+onLanguageChange(() => {
+  if (libraryEditor) openLibraryEditor();
+});
+
+// Library list rows bake their subtitle/placeholder/empty-state text into
+// plain innerHTML at render time (no data-i18n hooks to re-resolve), so a
+// generic applyTranslations() pass can't fix an already-rendered list --
+// rebuild it explicitly on language switch (same reasoning as the editor
+// listener above).
+onLanguageChange(() => render());
+
 // Human-readable "Location" for a track: the imported filename for local
 // uploads, otherwise the source URL.
 function libraryLocation(sourceUrl) {
   if (!sourceUrl) return "—";
-  if (sourceUrl.startsWith("local:")) return sourceUrl.slice(6) || "Imported file";
+  if (sourceUrl.startsWith("local:")) return sourceUrl.slice(6) || i18nT("library.importedFile");
   return sourceUrl;
 }
 
@@ -1977,8 +3150,8 @@ function refreshLibrarySyncSummary() {
   const n = libraryUnavailableCount();
   statusEl.classList.toggle("out-of-sync", n > 0);
   statusEl.textContent = n > 0
-    ? `${n} ${n === 1 ? "track is" : "tracks are"} out of sync`
-    : "All tracks in sync";
+    ? i18nPlural("settings.outOfSync.summary", n)
+    : i18nT("settings.outOfSync.allSynced");
 }
 
 function closeLibraryEditor() {
@@ -2007,7 +3180,7 @@ function renderLibraryRows(tbody) {
     const td = document.createElement("td");
     td.colSpan = 3;
     td.className = "library-editor-empty";
-    td.textContent = "All tracks are in sync.";
+    td.textContent = i18nT("settings.stemsLocation.inSync");
     tr.appendChild(td);
     tbody.appendChild(tr);
     return;
@@ -2025,7 +3198,7 @@ function renderLibraryRows(tbody) {
     if (t.status === "unavailable") {
       const badge = document.createElement("span");
       badge.className = "le-badge";
-      badge.textContent = "unavailable";
+      badge.textContent = i18nT("status.unavailable");
       name.appendChild(badge);
     }
 
@@ -2054,9 +3227,9 @@ function networkSettingsHtml() {
     <div class="settings-section">
       <div class="settings-row">
         <div class="settings-row-text">
-          <div class="settings-row-title">Make StemDeck available on your network</div>
-          <div class="settings-row-desc">Let other devices (like your phone) open StemDeck at the address below.</div>
-          <div class="settings-row-desc settings-lock-note">Read-only when StemDeck is started in server mode — network access is then set by your server configuration.</div>
+          <div class="settings-row-title" data-i18n="settings.network.allowTitle">Make StemDeck available on your network</div>
+          <div class="settings-row-desc" data-i18n="settings.network.allowDesc">Let other devices (like your phone) open StemDeck at the address below.</div>
+          <div class="settings-row-desc settings-lock-note" data-i18n="settings.network.lockNote">Read-only when StemDeck is started in server mode — network access is then set by your server configuration.</div>
         </div>
         <label class="settings-switch">
           <input type="checkbox" class="net-access-input" />
@@ -2064,53 +3237,311 @@ function networkSettingsHtml() {
         </label>
       </div>
       <div class="settings-net hidden">
+        <div class="settings-net-warn hidden"></div>
         <div class="settings-net-qr"></div>
       </div>
     </div>
   `;
 }
 
-// General settings: max track length (minutes) + MP4 video quality. Read live
+/** Long paths are truncated from the LEFT: the folder name is what the user
+ *  needs to see, and the leading /Users/... is the part they already know.
+ *  Done here rather than with CSS -- the direction:rtl trick that gives a
+ *  leading ellipsis also moves the path's leading slash to the far end, so
+ *  /private/tmp/x renders as tmp/x/ and reads like a different path. */
+export function shortenPath(path, max = 52) {
+  const text = String(path ?? "");
+  if (text.length <= max) return text;
+  return "…" + text.slice(text.length - (max - 1));
+}
+
+function formatSize(bytes) {
+  if (!bytes) return "";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i += 1;
+  }
+  return `${value >= 10 || i === 0 ? Math.round(value) : value.toFixed(1)} ${units[i]}`;
+}
+
+// Where extracted stems live (#354). Documents is a fine default until you
+// notice it is syncing tens of gigabytes to iCloud.
+// The folder dragged audio lands in. Desktop only: the drag gesture it serves
+// does not exist anywhere else, so the row is removed rather than shown inert.
+async function wireExportsLocation(overlay) {
+  const row = overlay.querySelector(".exports-location-row");
+  const pathEl = overlay.querySelector(".exports-location-path");
+  const btn = overlay.querySelector(".set-exports-location");
+  const msg = overlay.querySelector(".exports-location-msg");
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (!row || !pathEl || !btn) return;
+  if (!invoke) {
+    row.remove();
+    return;
+  }
+
+  const show = (dir) => {
+    pathEl.textContent = dir;
+    pathEl.title = dir;
+  };
+
+  try {
+    const dir = await invoke("current_exports_dir");
+    // A shell too old to know the command resolves it to null rather than
+    // failing, which would otherwise put the word "null" in the row.
+    if (!dir) {
+      row.remove();
+      return;
+    }
+    show(dir);
+  } catch (e) {
+    console.warn("[settings] could not read the exports location:", e);
+    row.remove();
+    return;
+  }
+
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      const picked = await invoke("pick_exports_folder");
+      if (picked) show(picked);
+    } catch (e) {
+      console.warn("[settings] exports folder picker failed:", e);
+      if (msg) {
+        msg.textContent = i18nT("settings.exportsLocation.pickerFailed");
+        msg.className = "exports-location-msg error";
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+async function wireStemsLocation(overlay) {
+  const pathEl = overlay.querySelector(".stems-location-path");
+  const sizeEl = overlay.querySelector(".stems-location-size");
+  const btn = overlay.querySelector(".set-stems-location");
+  const msg = overlay.querySelector(".stems-location-msg");
+  if (!pathEl || !btn) return;
+
+  const hideRow = () =>
+    overlay.querySelector(".stems-location")?.closest(".settings-row")?.remove();
+
+  let current = null;
+
+  const setMessage = (text, kind = "") => {
+    if (!msg) return;
+    msg.textContent = text || "";
+    msg.className = `stems-location-msg${kind ? " " + kind : ""}`;
+  };
+
+  const apply = (d) => {
+    current = d.path;
+    pathEl.textContent = shortenPath(d.path);
+    pathEl.title = d.path;
+    if (sizeEl) sizeEl.textContent = formatSize(d.bytes);
+    // Reopening Settings after a move, before the restart, should still say so.
+    if (d.restart_required) setMessage(i18nT("settings.stemsLocation.restartNote"), "ok");
+  };
+
+  // The backend decides whether this setting exists at all -- it is false on a
+  // server, Docker or Unraid deployment, where storage comes from a mounted
+  // volume the operator chose and moving it from inside the app would fight the
+  // mount. Asking it, rather than sniffing for Tauri, keeps that judgement in
+  // one place and means the row is testable in a browser against a desktop
+  // backend.
+  try {
+    const r = await fetch("/api/settings/stems-location", { cache: "no-store" });
+    if (!r.ok) {
+      hideRow();
+      return;
+    }
+    const data = await r.json();
+    if (!data.editable) {
+      hideRow();
+      return;
+    }
+    apply(data);
+  } catch (e) {
+    console.warn("[settings] could not read the stems location:", e);
+    hideRow();
+    return;
+  }
+
+  btn.addEventListener("click", async () => {
+    let picked = null;
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (invoke) {
+      try {
+        picked = await invoke("pick_stems_folder");
+      } catch (e) {
+        console.warn("[settings] folder picker failed:", e);
+        setMessage(i18nT("settings.stemsLocation.pickerFailed"), "error");
+        return;
+      }
+    } else {
+      // No native picker outside the desktop shell. Only reachable when a
+      // desktop-mode backend is being driven from a browser, which is a
+      // development setup -- in the shipped app invoke is always there.
+      picked = window.prompt("Full path to the folder for extracted stems:", current || "");
+    }
+    if (!picked) return; // cancelled
+
+    btn.disabled = true;
+    setMessage(i18nT("settings.stemsLocation.moving"));
+    try {
+      const r = await fetch("/api/settings/stems-location", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: picked }),
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        setMessage(data.detail || i18nT("settings.stemsLocation.moveFailed"), "error");
+        return;
+      }
+      // Re-read rather than trust the POST: the GET reports where the stems
+      // actually are now, including the size at the new location.
+      try {
+        const again = await fetch("/api/settings/stems-location", { cache: "no-store" });
+        if (again.ok) apply(await again.json());
+        else apply({ path: data.path, bytes: 0 });
+      } catch (e) {
+        console.warn("[settings] refresh failed:", e);
+        apply({ path: data.path, bytes: 0 });
+      }
+      if (data.persisted === false) {
+        // The physical move genuinely succeeded (moved_entries is real) --
+        // but settings.json didn't take the new path, so a restart right now
+        // would read the OLD default back while the library sits at the new
+        // folder (#403). Say so plainly rather than the usual "ok" message.
+        setMessage(i18nPlural("settings.stemsLocation.movedPersistFailed", data.moved_entries), "error");
+      } else {
+        setMessage(i18nPlural("settings.stemsLocation.movedOk", data.moved_entries), "ok");
+      }
+    } catch (e) {
+      console.warn("[settings] move failed:", e);
+      setMessage(i18nT("settings.stemsLocation.serverUnreachable"), "error");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+// Language picker: purely a client-side/cosmetic preference (no server
+// behavior depends on it), so it's read/written via setLanguage() (i18n.js,
+// storeGet/storeSet under "stemdeck.language") rather than the /api/settings
+// round trip the rest of this modal uses -- see i18n.js's module comment for
+// why that split matches the app's existing convention.
+function wireLanguageSetting(overlay) {
+  const sel = overlay.querySelector(".set-language");
+  if (!sel) return;
+  sel.innerHTML = LANGUAGES.map(
+    (l) => `<option value="${l.code}">${esc(l.flag)} ${esc(l.name)}</option>`,
+  ).join("");
+  sel.value = getLanguage();
+  sel.addEventListener("change", () => setLanguage(sel.value));
+}
+
+// General settings: max track length (minutes), playlist import limit, and
+// MP4 video quality. Read live
 // and POSTed on change to /api/settings (same runtime store as the toggle).
 async function wireGeneralSettings(overlay) {
   const durInput = overlay.querySelector(".set-max-duration");
+  const durDesc = overlay.querySelector(".set-max-duration-desc");
+  const playlistInput = overlay.querySelector(".set-playlist-max");
   const heightSel = overlay.querySelector(".set-video-height");
   const sampleRateSel = overlay.querySelector(".set-export-samplerate");
   const portInput = overlay.querySelector(".set-port");
   const deviceSel = overlay.querySelector(".set-demucs-device");
-  const deviceResolved = overlay.querySelector(".set-demucs-resolved");
+  const deviceDesc = overlay.querySelector(".set-demucs-desc");
   const qualitySel = overlay.querySelector(".set-separation-quality");
-  if (!durInput && !heightSel && !sampleRateSel && !portInput && !deviceSel && !qualitySel) return;
+  const cookiesInput = overlay.querySelector(".set-cookies-file");
+  const cookiesMsg = overlay.querySelector(".cookies-file-msg");
+  const autoDeleteInput = overlay.querySelector(".auto-delete-input");
+  const autoDeleteDaysRow = overlay.querySelector(".auto-delete-days-row");
+  const autoDeleteDays = overlay.querySelector(".set-auto-delete-days");
+  const autoDeleteDaysDesc = overlay.querySelector(".auto-delete-days-desc");
+  if (!durInput && !playlistInput && !heightSel && !sampleRateSel && !portInput && !deviceSel && !qualitySel && !cookiesInput && !autoDeleteInput) return;
 
   // Last server-confirmed device choice, to revert the select when the server
   // rejects a forced device (e.g. CUDA not available on this machine).
   let lastDevice = "auto";
 
+  // "Delete after" only means anything while automatic deletion is on. Dim it
+  // and take it out of the tab order rather than removing it, so the number is
+  // still readable: deciding whether to switch deletion on is easier when you
+  // can already see how long tracks would be kept.
+  const setDaysEnabled = (on) => {
+    autoDeleteDaysRow?.classList.toggle("disabled", !on);
+    if (autoDeleteDays) autoDeleteDays.disabled = !on;
+  };
+
   const apply = (d) => {
     if (durInput && d.max_duration_sec) durInput.value = String(Math.round(d.max_duration_sec / 60));
+    // Same reason: the copy in the description text went stale alongside the
+    // clamp, telling the user "max 20" for a limit that was really 60.
+    if (durDesc && d.max_duration_max_sec) {
+      durDesc.textContent = i18nT("settings.maxDuration.desc", {
+        max: Math.round(d.max_duration_max_sec / 60),
+      });
+    }
+    if (playlistInput && d.playlist_max_items) playlistInput.value = String(d.playlist_max_items);
     if (heightSel && d.video_max_height) heightSel.value = String(d.video_max_height);
     if (sampleRateSel && d.export_sample_rate) sampleRateSel.value = String(d.export_sample_rate);
     if (portInput && d.port) portInput.value = String(d.port);
     if (qualitySel && d.separation_quality) qualitySel.value = d.separation_quality;
+    // Unset is the normal case, so read the key rather than truthiness --
+    // clearing the field must survive the round trip and not be repopulated.
+    if (cookiesInput && "cookies_file" in d) cookiesInput.value = d.cookies_file || "";
+    // Read the key, not truthiness: false is the normal value here and the
+    // whole point of the setting, so `d.auto_delete_jobs &&` would leave the
+    // switch showing whatever it showed last.
+    if (autoDeleteInput && "auto_delete_jobs" in d) {
+      autoDeleteInput.checked = d.auto_delete_jobs === true;
+      setDaysEnabled(autoDeleteInput.checked);
+    }
+    // Never overwrite a field the user is currently in. Flipping the switch
+    // POSTs, and that response used to land on top of whatever they had just
+    // started typing into the field the switch had only just enabled. The
+    // days handler below writes its own result back explicitly, so the
+    // server still owns the ceiling.
+    if (autoDeleteDays && d.auto_delete_days && document.activeElement !== autoDeleteDays) {
+      autoDeleteDays.value = String(d.auto_delete_days);
+    }
+    if (autoDeleteDaysDesc && d.auto_delete_days_max) {
+      autoDeleteDaysDesc.textContent = i18nT("settings.autoDelete.daysDesc", {
+        max: d.auto_delete_days_max,
+      });
+    }
     if (deviceSel) {
       // Gray out devices this machine can't use (Auto and CPU are always
       // available). Label disabled options so it's clear WHY they're greyed.
+      // The base label is captured into a data attribute the first time this
+      // runs (before any "not available" suffix is ever appended), rather
+      // than stripped back out of a previous textContent each call -- a
+      // regex keyed to the English suffix would silently stop matching once
+      // that suffix is translated, leaving the untranslated suffix appended
+      // forever on every subsequent apply().
       const avail = new Set(d.demucs_devices_available || []);
       for (const opt of deviceSel.options) {
-        const base = opt.textContent.replace(/ — not available$/, "");
+        if (opt.dataset.baseLabel === undefined) opt.dataset.baseLabel = opt.textContent;
+        const base = opt.dataset.baseLabel;
         const ok = opt.value === "auto" || avail.has(opt.value);
         opt.disabled = !ok;
-        opt.textContent = ok ? base : `${base} — not available`;
+        opt.textContent = ok ? base : `${base}${i18nT("settings.device.notAvailable")}`;
       }
       if (d.demucs_device) {
         deviceSel.value = d.demucs_device;
         lastDevice = d.demucs_device;
       }
     }
-    if (deviceResolved) {
-      deviceResolved.textContent = d.demucs_device_resolved
-        ? ` (currently: ${d.demucs_device_resolved})`
-        : "";
+    if (deviceDesc) {
+      const resolved = d.demucs_device_resolved ? i18nT("settings.device.currently", { device: d.demucs_device_resolved }) : "";
+      deviceDesc.textContent = i18nT("settings.device.desc", { resolved });
     }
   };
 
@@ -2120,7 +3551,9 @@ async function wireGeneralSettings(overlay) {
     if (cleaned !== input.value) input.value = cleaned;
   });
   digitsOnly(durInput);
+  digitsOnly(playlistInput);
   digitsOnly(portInput);
+  digitsOnly(autoDeleteDays);
 
   try {
     const r = await fetch("/api/settings", { cache: "no-store" });
@@ -2134,13 +3567,47 @@ async function wireGeneralSettings(overlay) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
       });
-      if (r.ok) apply(await r.json()); // reflect the server's clamped value
+      if (r.ok) {
+        const data = await r.json();
+        apply(data); // reflect the server's clamped value
+        return data;
+      }
     } catch { /* ignore */ }
+    return null;
   };
 
   durInput?.addEventListener("change", () => {
-    const mins = Math.max(1, Math.min(20, parseInt(durInput.value, 10) || 20));
+    // No ceiling of its own. This used to clamp to 20 while the backend
+    // allowed 60, so typing 60 silently posted 20 and the field snapped back
+    // with no explanation. The server clamps and returns the value it kept,
+    // and apply() writes that back, so it stays the single authority.
+    const mins = Math.max(1, parseInt(durInput.value, 10) || 20);
     post({ max_duration_sec: mins * 60 });
+  });
+  playlistInput?.addEventListener("change", () => {
+    const items = Math.max(1, Math.min(200, parseInt(playlistInput.value, 10) || 50));
+    post({ playlist_max_items: items });
+  });
+  // Not routed through post(): that helper drops a non-ok response silently,
+  // which is exactly the wrong behaviour for a path the user typed. A bad path
+  // has to say so, or the user retypes it and never learns why nothing
+  // happened.
+  cookiesInput?.addEventListener("change", async () => {
+    if (cookiesMsg) cookiesMsg.textContent = "";
+    try {
+      const r = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cookies_file: cookiesInput.value.trim() }),
+      });
+      if (r.ok) {
+        apply(await r.json());
+      } else if (cookiesMsg) {
+        // The server's detail is an English string; show the translated key
+        // instead so this reads correctly in every locale.
+        cookiesMsg.textContent = i18nT("settings.cookies.invalid");
+      }
+    } catch { /* offline: leave the field as typed */ }
   });
   heightSel?.addEventListener("change", () => {
     post({ video_max_height: parseInt(heightSel.value, 10) });
@@ -2154,6 +3621,23 @@ async function wireGeneralSettings(overlay) {
   });
   qualitySel?.addEventListener("change", () => {
     post({ separation_quality: qualitySel.value });
+  });
+  autoDeleteInput?.addEventListener("change", () => {
+    // Enable the days field immediately rather than waiting for the round
+    // trip, so the switch does not appear to do nothing on a slow response.
+    // apply() sets it again from the server's answer either way.
+    setDaysEnabled(autoDeleteInput.checked);
+    post({ auto_delete_jobs: autoDeleteInput.checked });
+  });
+  autoDeleteDays?.addEventListener("change", async () => {
+    // Floor of 1 only. The server owns the ceiling and returns what it kept,
+    // the same arrangement as max track length, so the two cannot drift.
+    const days = Math.max(1, parseInt(autoDeleteDays.value, 10) || 30);
+    const data = await post({ auto_delete_days: days });
+    // Written back here rather than left to apply(), which skips a focused
+    // field: committing with Enter keeps focus, and the user still has to see
+    // the number the server actually kept.
+    if (data?.auto_delete_days) autoDeleteDays.value = String(data.auto_delete_days);
   });
   // Compute device needs its own POST path: unlike the clamped numeric
   // settings, the server can REJECT a forced device (422 with a reason, e.g.
@@ -2169,7 +3653,7 @@ async function wireGeneralSettings(overlay) {
         apply(await r.json());
         return;
       }
-      let detail = "Could not change the compute device.";
+      let detail = i18nT("settings.device.changeFailed");
       try {
         detail = (await r.json()).detail || detail;
       } catch (err) {
@@ -2211,12 +3695,27 @@ async function wireNetworkSetting(overlay) {
   // QR codes: one per LAN address, each encodes the /mobile/ URL so the
   // phone camera opens StemDeck directly. Cards start blurred so an open
   // camera app on a nearby device doesn't scan them before you're ready.
+  // Transpose is an AudioWorklet, which browsers hand out only on a secure
+  // origin, so what this warning has to say depends on whether the addresses
+  // below are https. Getting it wrong in either direction is worse than saying
+  // nothing: over http the key control is simply dead with no reason given,
+  // and over https the phone throws a "not private" page that looks like the
+  // app is broken or unsafe when it is neither.
+  const warnEl = overlay.querySelector(".settings-net-warn");
+  if (warnEl) {
+    const secure = addresses.length > 0 && addresses.every((a) => a.startsWith("https://"));
+    warnEl.textContent = i18nT(
+      secure ? "settings.network.transposeCertPrompt" : "settings.network.transposeNeedsHttps",
+    );
+    warnEl.classList.toggle("hidden", addresses.length === 0);
+  }
+
   if (qrWrap) {
     qrWrap.textContent = "";
     if (addresses.length) {
       const hint = document.createElement("p");
       hint.className = "qr-hint";
-      hint.textContent = "Blurred so your camera doesn't get too excited. Tap to reveal.";
+      hint.textContent = i18nT("settings.network.qrHint");
       qrWrap.appendChild(hint);
       const row = document.createElement("div");
       row.className = "qr-cards-row";
@@ -2224,11 +3723,11 @@ async function wireNetworkSetting(overlay) {
         const mobileUrl = `${a}/mobile/`;
         const card = document.createElement("div");
         card.className = "qr-card qr-blurred";
-        card.title = "Tap to unblur";
+        card.title = i18nT("settings.network.tapToUnblur");
         card.addEventListener("click", () => card.classList.toggle("qr-blurred"));
         const img = document.createElement("img");
         img.src = `/api/qr?url=${encodeURIComponent(mobileUrl)}`;
-        img.alt = `QR code for ${mobileUrl}`;
+        img.alt = i18nT("settings.network.qrCodeFor", { url: mobileUrl });
         img.width = 130;
         img.height = 130;
         const label = document.createElement("div");
@@ -2244,7 +3743,7 @@ async function wireNetworkSetting(overlay) {
     } else {
       const span = document.createElement("span");
       span.className = "settings-net-empty";
-      span.textContent = "No local network connection detected.";
+      span.textContent = i18nT("settings.network.noConnection");
       qrWrap.appendChild(span);
     }
   }
@@ -2273,7 +3772,12 @@ async function wireNetworkSetting(overlay) {
 }
 
 async function loadRegistryView(overlay) {
-  const view = overlay.querySelector(".settings-registry-view");
+  // Scoped to the registry pane: the log viewers reuse .settings-registry-view
+  // for its read-only-textarea styling and sit earlier in the markup, so a bare
+  // class lookup returned the *application log* box. The registry JSON was
+  // being written into a hidden textarea while the registry pane sat on its
+  // literal "Loading…" placeholder for ever.
+  const view = overlay.querySelector('[data-pane="registry"] .settings-registry-view');
   if (!view) return;
   view.value = "Loading…";
   try {
@@ -2281,6 +3785,105 @@ async function loadRegistryView(overlay) {
     view.value = r.ok ? await r.text() : `Failed to load registry (status ${r.status}).`;
   } catch {
     view.value = "Failed to load registry — check your connection.";
+  }
+}
+
+function _fmtBytes(n) {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n < 10 && i > 0 ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
+}
+
+/** Read-only listing of the log files: paths, sizes and what writes each one.
+ *  Contents are deliberately not served -- a traceback can capture anything,
+ *  and the files are on the machine the user is already sitting at. */
+async function loadLogsView(overlay) {
+  const pathEl = overlay.querySelector(".settings-logs-path");
+  const listEl = overlay.querySelector(".settings-logs-list");
+  if (!pathEl || !listEl) return;
+  listEl.textContent = i18nT("settings.logs.loading");
+  try {
+    const r = await fetch("/api/logs", { cache: "no-store" });
+    if (!r.ok) throw new Error(`status ${r.status}`);
+    const info = await r.json();
+    pathEl.textContent = info.dir;
+    const present = (info.files || []).filter((f) => f.exists);
+    if (!present.length) {
+      listEl.innerHTML = `<div class="settings-logs-empty">${esc(i18nT("settings.logs.noFilesYet", {
+        folderNote: info.dir_exists ? "" : i18nT("settings.logs.folderNotCreated"),
+      }))}</div>`;
+      return;
+    }
+    listEl.innerHTML = present
+      .map((f) => {
+        const when = f.modified
+          ? new Date(f.modified * 1000).toLocaleString()
+          : "";
+        return `<div class="settings-log-row">
+            <div class="settings-log-main">
+              <code class="settings-log-name">${f.name}</code>
+              <span class="settings-log-meta">${_fmtBytes(f.size)}${when ? ` · ${when}` : ""}</span>
+            </div>
+            <div class="settings-log-desc">${f.description}</div>
+          </div>`;
+      })
+      .join("");
+  } catch (e) {
+    console.warn("[settings] failed to load log info:", e);
+    pathEl.textContent = i18nT("status.unavailable");
+    listEl.textContent = i18nT("settings.logs.failedToLoad");
+  }
+}
+
+/** Recent lines from one log, read-only. The window is applied server-side so
+ *  a large file is never shipped in full. */
+async function loadLogTail(overlay, view) {
+  const el = overlay.querySelector(`.settings-logtail-view[data-view="${view}"]`);
+  if (!el) return;
+  el.value = "Loading…";
+  try {
+    const r = await fetch(`/api/logs/${view}?minutes=60`, { cache: "no-store" });
+    el.value = r.ok ? await r.text() : `Failed to load the log (status ${r.status}).`;
+  } catch (e) {
+    console.warn("[settings] failed to load log tail:", e);
+    el.value = "Failed to load the log — check your connection.";
+  }
+  // Newest entries are the interesting ones.
+  el.scrollTop = el.scrollHeight;
+}
+
+/** Download every log file as one zip, for attaching to a bug report. */
+async function exportLogs(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = i18nT("settings.exportLogs.preparing"); }
+  try {
+    const r = await fetch("/api/logs.zip", { cache: "no-store" });
+    if (!r.ok) throw new Error(`status ${r.status}`);
+    const blob = await r.blob();
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `stemdeck-logs-${stamp}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    // Log export isn't tied to a track/job, so a plain by-kind dismiss is the
+    // right granularity — it never touches a per-track export failure (#401).
+    dismissFailuresByKind("export");
+  } catch (e) {
+    console.warn("[settings] log export failed:", e);
+    showError(i18nT("settings.exportLogs.error"), null, { retry: false });
+    notifyFailure({
+      kind: "export",
+      message: i18nT("settings.exportLogs.error"),
+      detail: String(e?.message || e),
+      context: { stage: "Exporting logs" },
+    });
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = i18nT("settings.exportLogs.button"); }
   }
 }
 
@@ -2296,18 +3899,19 @@ function openResetConfirm() {
   const overlay = document.createElement("div");
   overlay.className = "reset-confirm-backdrop";
   overlay.innerHTML = `
-    <div class="reset-confirm-card" role="dialog" aria-modal="true" aria-label="Reset app data">
-      <div class="reset-confirm-title">Reset app data?</div>
-      <p class="reset-confirm-body">This permanently deletes every track, job, and library entry. On a shared server this affects everyone who uses it. This cannot be undone.</p>
-      <p class="reset-confirm-hint">Type <strong>RESET</strong> to confirm.</p>
-      <input class="reset-confirm-input" type="text" autocomplete="off" spellcheck="false" aria-label="Type RESET to confirm" />
+    <div class="reset-confirm-card" role="dialog" aria-modal="true" aria-label="Reset app data" data-i18n-aria-label="resetConfirm.ariaLabel">
+      <div class="reset-confirm-title" data-i18n="resetConfirm.title">Reset app data?</div>
+      <p class="reset-confirm-body" data-i18n="resetConfirm.body">This permanently deletes every track, job, and library entry. On a shared server this affects everyone who uses it. This cannot be undone.</p>
+      <p class="reset-confirm-hint" data-i18n="resetConfirm.hint">Type <strong>RESET</strong> to confirm.</p>
+      <input class="reset-confirm-input" type="text" autocomplete="off" spellcheck="false" aria-label="Type RESET to confirm" data-i18n-aria-label="resetConfirm.typeToConfirmAria" />
       <div class="reset-confirm-msg" role="alert" aria-live="polite"></div>
       <div class="reset-confirm-actions">
-        <button class="reset-confirm-cancel" type="button">Cancel</button>
-        <button class="reset-confirm-go" type="button" disabled>Reset app data</button>
+        <button class="reset-confirm-cancel" type="button" data-i18n="resetConfirm.cancel">Cancel</button>
+        <button class="reset-confirm-go" type="button" disabled data-i18n="resetConfirm.go">Reset app data</button>
       </div>
     </div>
   `;
+  applyTranslations(overlay);
 
   const input = overlay.querySelector(".reset-confirm-input");
   const goBtn = overlay.querySelector(".reset-confirm-go");
@@ -2324,11 +3928,11 @@ function openResetConfirm() {
   goBtn.addEventListener("click", async () => {
     goBtn.disabled = true;
     input.disabled = true;
-    msg.textContent = "Resetting…";
+    msg.textContent = i18nT("resetConfirm.resetting");
     try {
       const r = await fetch("/api/reset", { method: "POST" });
       if (!r.ok) {
-        let detail = "Reset failed.";
+        let detail = i18nT("resetConfirm.failed");
         try { detail = (await r.json()).detail || detail; } catch (err) { console.warn("reset error body parse failed:", err); }
         msg.textContent = detail;
         goBtn.disabled = false;
@@ -2351,7 +3955,7 @@ function openResetConfirm() {
       window.location.reload();
     } catch (err) {
       console.warn("reset failed:", err);
-      msg.textContent = "Reset failed — check your connection.";
+      msg.textContent = i18nT("resetConfirm.failedConnection");
       goBtn.disabled = false;
       input.disabled = false;
     }
@@ -2369,37 +3973,101 @@ function openLibraryEditor() {
   const overlay = document.createElement("div");
   overlay.className = "library-editor-backdrop";
   overlay.innerHTML = `
-    <div class="library-editor" role="dialog" aria-modal="true" aria-label="Settings">
+    <div class="library-editor" role="dialog" aria-modal="true" aria-label="Settings" data-i18n-aria-label="settings.title">
       <div class="library-editor-head">
-        <span>Settings</span>
-        <button class="library-editor-close" type="button" aria-label="Close">
+        <span data-i18n="settings.title">Settings</span>
+        <button class="library-editor-close" type="button" aria-label="Close" data-i18n-aria-label="settings.closeAria">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg>
         </button>
       </div>
       <div class="settings-tabs" role="tablist">
-        <button class="settings-tab active" type="button" data-tab="general" role="tab">General</button>
-        <button class="settings-tab" type="button" data-tab="network" role="tab">Network</button>
-        <button class="settings-tab" type="button" data-tab="export" role="tab">Export</button>
-        <button class="settings-tab" type="button" data-tab="registry" role="tab">Registry</button>
+        <button class="settings-tab active" type="button" data-tab="general" role="tab" data-i18n="settings.tab.general">General</button>
+        <button class="settings-tab" type="button" data-tab="network" role="tab" data-i18n="settings.tab.network">Network</button>
+        <button class="settings-tab" type="button" data-tab="export" role="tab" data-i18n="settings.tab.export">Export</button>
+        <button class="settings-tab" type="button" data-tab="logs" role="tab" data-i18n="settings.tab.logs">Logs</button>
+        <button class="settings-tab" type="button" data-tab="registry" role="tab" data-i18n="settings.tab.registry">Registry</button>
       </div>
       <div class="settings-pane" data-pane="general">
         <div class="settings-section">
           <div class="settings-row">
             <div class="settings-row-text">
-              <div class="settings-row-title">Max track length</div>
-              <div class="settings-row-desc">Longest track accepted for processing, in minutes (max 20).</div>
+              <div class="settings-row-title" data-i18n="settings.language.title">Language</div>
+              <div class="settings-row-desc" data-i18n="settings.language.desc">Display language for this app.</div>
             </div>
-            <input type="text" class="settings-num-input set-max-duration" inputmode="numeric" maxlength="2" aria-label="Max track length in minutes" />
+            <select class="settings-select settings-select-wide set-language" aria-label="Language"></select>
           </div>
         </div>
         <div class="settings-section">
           <div class="settings-row">
             <div class="settings-row-text">
-              <div class="settings-row-title">Compute device</div>
-              <div class="settings-row-desc">Device used for stem separation. Applies to the next track<span class="set-demucs-resolved"></span>.</div>
+              <div class="settings-row-title" data-i18n="settings.maxDuration.title">Max track length</div>
+              <div class="settings-row-desc set-max-duration-desc">Longest track accepted for processing, in minutes (max 60).</div>
             </div>
-            <select class="settings-select set-demucs-device" aria-label="Compute device">
-              <option value="auto">Auto</option>
+            <input type="text" class="settings-num-input set-max-duration" inputmode="numeric" maxlength="2" aria-label="Max track length in minutes" data-i18n-aria-label="settings.maxDuration.title" />
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.playlistLimit.title">Playlist import limit</div>
+              <div class="settings-row-desc" data-i18n="settings.playlistLimit.desc">Most tracks one playlist import will queue (max 200).</div>
+            </div>
+            <input type="text" class="settings-num-input set-playlist-max" inputmode="numeric" maxlength="3" aria-label="Playlist import limit" data-i18n-aria-label="settings.playlistLimit.title" />
+          </div>
+          <div class="settings-row settings-row-stack">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.cookies.title">YouTube cookies</div>
+              <div class="settings-row-desc" data-i18n="settings.cookies.desc">Optional. Path to a cookies.txt file, used only when YouTube asks StemDeck to confirm it is not a bot. Leave this empty unless imports are failing.</div>
+            </div>
+            <input type="text" class="settings-text-input set-cookies-file" spellcheck="false" autocomplete="off" placeholder="Path to cookies.txt" data-i18n-placeholder="settings.cookies.placeholder" aria-label="YouTube cookies" data-i18n-aria-label="settings.cookies.title" />
+            <div class="cookies-file-msg" role="status" aria-live="polite"></div>
+          </div>
+          <div class="settings-row settings-row-stack">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.stemsLocation.title">StemData location</div>
+            </div>
+            <div class="stems-location">
+              <code class="stems-location-path" title=""></code>
+              <span class="stems-location-size"></span>
+              <button class="settings-btn set-stems-location" type="button" data-i18n="settings.stemsLocation.change">Change…</button>
+            </div>
+            <div class="stems-location-msg" role="status" aria-live="polite"></div>
+          </div>
+          <div class="settings-row settings-row-stack exports-location-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.exportsLocation.title">Exports folder</div>
+              <div class="settings-row-desc" data-i18n="settings.exportsLocation.desc">Where audio goes when you drag a stem or a loop out of StemDeck. Nothing here is ever deleted automatically, because a project that references a dragged file needs it to stay put.</div>
+            </div>
+            <div class="stems-location">
+              <code class="exports-location-path" title=""></code>
+              <button class="settings-btn set-exports-location" type="button" data-i18n="settings.exportsLocation.change">Change…</button>
+            </div>
+            <div class="exports-location-msg" role="status" aria-live="polite"></div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.autoDelete.title">Automatically delete finished tracks</div>
+              <div class="settings-row-desc" data-i18n="settings.autoDelete.desc">Off unless you turn it on. Separated tracks are kept forever by default. Deleting them cannot be undone.</div>
+            </div>
+            <label class="settings-switch">
+              <input type="checkbox" class="auto-delete-input" />
+              <span class="settings-switch-track"><span class="settings-switch-thumb"></span></span>
+            </label>
+          </div>
+          <div class="settings-row auto-delete-days-row disabled">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.autoDelete.daysTitle">Delete after</div>
+              <div class="settings-row-desc auto-delete-days-desc">Days a finished track is kept before it is deleted.</div>
+            </div>
+            <input type="text" class="settings-num-input set-auto-delete-days" inputmode="numeric" maxlength="3" aria-label="Days a track is kept" data-i18n-aria-label="settings.autoDelete.daysTitle" />
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.device.title">Compute device</div>
+              <div class="settings-row-desc set-demucs-desc">Device used for stem separation. Applies to the next track.</div>
+            </div>
+            <select class="settings-select settings-select-wide set-demucs-device" aria-label="Compute device" data-i18n-aria-label="settings.device.title">
+              <option value="auto" data-i18n="settings.device.auto">Auto</option>
               <option value="cuda">CUDA (NVIDIA)</option>
               <option value="mps">MPS (Apple Silicon)</option>
               <option value="cpu">CPU</option>
@@ -2409,34 +4077,43 @@ function openLibraryEditor() {
         <div class="settings-section">
           <div class="settings-row">
             <div class="settings-row-text">
-              <div class="settings-row-title">Separation quality</div>
-              <div class="settings-row-desc">Best runs the separator twice with randomized shifts and averages the result — cleaner stems, twice the time.</div>
+              <div class="settings-row-title" data-i18n="settings.quality.title">Separation quality</div>
+              <div class="settings-row-desc" data-i18n="settings.quality.desc">Best runs the separator twice with randomized shifts and averages the result — cleaner stems, twice the time.</div>
             </div>
-            <select class="settings-select set-separation-quality" aria-label="Separation quality">
-              <option value="standard">Standard</option>
-              <option value="best">Best (2× slower)</option>
+            <select class="settings-select settings-select-wide set-separation-quality" aria-label="Separation quality" data-i18n-aria-label="settings.quality.title">
+              <option value="standard" data-i18n="settings.quality.standard">Standard</option>
+              <option value="best" data-i18n="settings.quality.best">Best (2× slower)</option>
             </select>
           </div>
         </div>
-        <div class="settings-subhead">Out of sync tracks</div>
+        <div class="settings-subhead" data-i18n="settings.outOfSync.subhead">Out of sync tracks</div>
         <div class="library-editor-table-wrap">
           <table class="library-editor-table">
-            <thead><tr><th>Name</th><th>Source</th><th>Location</th></tr></thead>
+            <thead><tr><th data-i18n="settings.outOfSync.colName">Name</th><th data-i18n="settings.outOfSync.colSource">Source</th><th data-i18n="settings.outOfSync.colLocation">Location</th></tr></thead>
             <tbody class="library-editor-body"></tbody>
           </table>
         </div>
         <div class="library-editor-foot">
           <span class="library-editor-status" aria-live="polite"></span>
-          <button class="library-editor-sync" type="button">Resync out of sync tracks</button>
+          <button class="library-editor-sync" type="button" data-i18n="settings.outOfSync.resync">Resync out of sync tracks</button>
         </div>
-        <div class="settings-section settings-danger-zone">
-          <div class="settings-subhead settings-danger-subhead">Danger zone</div>
+        <div class="settings-section">
           <div class="settings-row">
             <div class="settings-row-text">
-              <div class="settings-row-title">Reset app data</div>
-              <div class="settings-row-desc">Permanently deletes every track, job, and library entry. On a shared server this affects everyone who uses it. Cannot be undone.</div>
+              <div class="settings-row-title" data-i18n="settings.exportLogs.title">Export logs</div>
+              <div class="settings-row-desc" data-i18n="settings.exportLogs.desc">Download every log file as a single zip — the thing to attach to a bug report. See the Logs tab for where they live.</div>
             </div>
-            <button class="settings-reset-btn" type="button">Reset app data…</button>
+            <button class="settings-export-logs" type="button" data-i18n="settings.exportLogs.button">Export logs</button>
+          </div>
+        </div>
+        <div class="settings-section settings-danger-zone">
+          <div class="settings-subhead settings-danger-subhead" data-i18n="settings.dangerZone">Danger zone</div>
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.resetData.title">Reset app data</div>
+              <div class="settings-row-desc" data-i18n="settings.resetData.desc">Permanently deletes every track, job, and library entry. On a shared server this affects everyone who uses it. Cannot be undone.</div>
+            </div>
+            <button class="settings-reset-btn" type="button" data-i18n="settings.resetData.button">Reset app data…</button>
           </div>
         </div>
       </div>
@@ -2445,10 +4122,10 @@ function openLibraryEditor() {
         <div class="settings-section">
           <div class="settings-row">
             <div class="settings-row-text">
-              <div class="settings-row-title">Port</div>
-              <div class="settings-row-desc">Port StemDeck runs on. Restart to apply.</div>
+              <div class="settings-row-title" data-i18n="settings.network.port.title">Port</div>
+              <div class="settings-row-desc" data-i18n="settings.network.port.desc">Port StemDeck runs on. Restart to apply.</div>
             </div>
-            <input type="text" class="settings-num-input set-port" inputmode="numeric" maxlength="5" aria-label="Port" />
+            <input type="text" class="settings-num-input set-port" inputmode="numeric" maxlength="5" aria-label="Port" data-i18n-aria-label="settings.network.port.title" />
           </div>
         </div>
       </div>
@@ -2456,10 +4133,10 @@ function openLibraryEditor() {
         <div class="settings-section">
           <div class="settings-row">
             <div class="settings-row-text">
-              <div class="settings-row-title">Sample rate</div>
-              <div class="settings-row-desc">Sample rate for exported mixes and regions (WAV, FLAC, MP3). 44.1 kHz suits most DAWs and samplers; pick another if your hardware needs it.</div>
+              <div class="settings-row-title" data-i18n="settings.export.sampleRate.title">Sample rate</div>
+              <div class="settings-row-desc" data-i18n="settings.export.sampleRate.desc">Sample rate for exported mixes and regions (WAV, FLAC, MP3). 44.1 kHz suits most DAWs and samplers; pick another if your hardware needs it.</div>
             </div>
-            <select class="settings-select set-export-samplerate" aria-label="Export sample rate">
+            <select class="settings-select set-export-samplerate" aria-label="Export sample rate" data-i18n-aria-label="settings.export.sampleRate.title">
               <option value="22050">22.05 kHz</option>
               <option value="32000">32 kHz</option>
               <option value="44100">44.1 kHz</option>
@@ -2470,8 +4147,8 @@ function openLibraryEditor() {
         <div class="settings-section">
           <div class="settings-row">
             <div class="settings-row-text">
-              <div class="settings-row-title">MP4 video quality</div>
-              <div class="settings-row-desc">Max resolution for MP4 export and YouTube video.</div>
+              <div class="settings-row-title" data-i18n="settings.export.videoQuality.title">MP4 video quality</div>
+              <div class="settings-row-desc" data-i18n="settings.export.videoQuality.desc">Max resolution for MP4 export and YouTube video.</div>
             </div>
             <select class="settings-select set-video-height">
               <option value="360">360p</option>
@@ -2482,21 +4159,71 @@ function openLibraryEditor() {
           </div>
         </div>
       </div>
+      <div class="settings-pane hidden" data-pane="logs">
+        <div class="settings-subtabs" role="tablist">
+          <button class="settings-subtab active" type="button" data-sub="location" role="tab" data-i18n="settings.logs.locationTab">Location</button>
+          <button class="settings-subtab" type="button" data-sub="application" role="tab" data-i18n="settings.logs.applicationTab">Application log</button>
+          <button class="settings-subtab" type="button" data-sub="backend" role="tab" data-i18n="settings.logs.backendTab">Backend log</button>
+          <button class="settings-subtab" type="button" data-sub="setup" role="tab" data-i18n="settings.logs.setupTab">Setup log</button>
+        </div>
+        <div class="settings-subpane" data-subpane="location">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.logs.location.title">Log location</div>
+              <div class="settings-row-desc" data-i18n="settings.logs.location.desc">Where StemDeck writes its logs on this machine. Read-only — open them in a file manager or use Export logs.</div>
+            </div>
+            <button class="settings-registry-refresh settings-logs-refresh" type="button" data-i18n="settings.logs.refresh">Refresh</button>
+          </div>
+          <div class="settings-logs-dir"><code class="settings-logs-path" data-i18n="settings.logs.loading">Loading…</code></div>
+          <div class="settings-logs-list" data-i18n="settings.logs.loading">Loading…</div>
+        </div>
+        <div class="settings-subpane hidden" data-subpane="application">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.logs.application.title">Application log</div>
+              <div class="settings-row-desc" data-i18n="settings.logs.application.desc">The last hour from <code>stemdeck.log</code> — pipeline, API and job activity. Read-only.</div>
+            </div>
+            <button class="settings-registry-refresh settings-logtail-refresh" type="button" data-view="application" data-i18n="settings.logs.refresh">Refresh</button>
+          </div>
+          <textarea class="settings-registry-view settings-logtail-view" data-view="application" readonly spellcheck="false" aria-label="Application log (read only)" data-i18n-aria-label="settings.logs.applicationAria" data-i18n="settings.logs.loading">Loading…</textarea>
+        </div>
+        <div class="settings-subpane hidden" data-subpane="backend">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.logs.backend.title">Backend log</div>
+              <div class="settings-row-desc" data-i18n="settings.logs.backend.desc">The last hour from <code>backend.log</code> — raw output of the bundled Python process, including anything that crashed it before the application log could record it. Desktop app only. Read-only.</div>
+            </div>
+            <button class="settings-registry-refresh settings-logtail-refresh" type="button" data-view="backend" data-i18n="settings.logs.refresh">Refresh</button>
+          </div>
+          <textarea class="settings-registry-view settings-logtail-view" data-view="backend" readonly spellcheck="false" aria-label="Backend log (read only)" data-i18n-aria-label="settings.logs.backendAria" data-i18n="settings.logs.loading">Loading…</textarea>
+        </div>
+        <div class="settings-subpane hidden" data-subpane="setup">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title" data-i18n="settings.logs.setup.title">Setup log</div>
+              <div class="settings-row-desc" data-i18n="settings.logs.setup.desc">The last hour from <code>setup.log</code> — first-run setup and GPU runtime installation. Desktop app only. Read-only.</div>
+            </div>
+            <button class="settings-registry-refresh settings-logtail-refresh" type="button" data-view="setup" data-i18n="settings.logs.refresh">Refresh</button>
+          </div>
+          <textarea class="settings-registry-view settings-logtail-view" data-view="setup" readonly spellcheck="false" aria-label="Setup log (read only)" data-i18n-aria-label="settings.logs.setupAria" data-i18n="settings.logs.loading">Loading…</textarea>
+        </div>
+      </div>
       <div class="settings-pane hidden" data-pane="registry">
         <div class="settings-row">
           <div class="settings-row-text">
-            <div class="settings-row-title">Job registry</div>
-            <div class="settings-row-desc">Read-only view of <code>registry.json</code> — the persisted list of completed jobs on disk.</div>
+            <div class="settings-row-title" data-i18n="settings.registry.title">Job registry</div>
+            <div class="settings-row-desc" data-i18n="settings.registry.desc">Read-only view of <code>registry.json</code> — the persisted list of completed jobs on disk.</div>
           </div>
-          <button class="settings-registry-refresh" type="button">Refresh</button>
+          <button class="settings-registry-refresh" type="button" data-i18n="settings.logs.refresh">Refresh</button>
         </div>
-        <textarea class="settings-registry-view" readonly spellcheck="false" aria-label="Job registry (read only)">Loading…</textarea>
+        <textarea class="settings-registry-view" readonly spellcheck="false" aria-label="Job registry (read only)" data-i18n-aria-label="settings.registry.aria" data-i18n="settings.logs.loading">Loading…</textarea>
       </div>
       <div class="settings-foot">
-        <button class="settings-done" type="button">Done</button>
+        <button class="settings-done" type="button" data-i18n="settings.done">Done</button>
       </div>
     </div>
   `;
+  applyTranslations(overlay);
 
   renderLibraryRows(overlay.querySelector(".library-editor-body"));
 
@@ -2506,9 +4233,24 @@ function openLibraryEditor() {
       overlay.querySelectorAll(".settings-tab").forEach((t) => t.classList.toggle("active", t === tab));
       overlay.querySelectorAll(".settings-pane").forEach((p) => p.classList.toggle("hidden", p.dataset.pane !== name));
       if (name === "registry") loadRegistryView(overlay);
+      if (name === "logs") loadLogsView(overlay);
     });
   });
-  overlay.querySelector(".settings-registry-refresh")?.addEventListener("click", () => loadRegistryView(overlay));
+  overlay.querySelector(".settings-registry-refresh:not(.settings-logs-refresh)")
+    ?.addEventListener("click", () => loadRegistryView(overlay));
+  overlay.querySelector(".settings-logs-refresh")?.addEventListener("click", () => loadLogsView(overlay));
+  overlay.querySelectorAll(".settings-subtab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      const name = tab.dataset.sub;
+      overlay.querySelectorAll(".settings-subtab").forEach((t) => t.classList.toggle("active", t === tab));
+      overlay.querySelectorAll(".settings-subpane").forEach((p) => p.classList.toggle("hidden", p.dataset.subpane !== name));
+      if (name === "location") loadLogsView(overlay);
+      else loadLogTail(overlay, name);
+    });
+  });
+  overlay.querySelectorAll(".settings-logtail-refresh").forEach((b) =>
+    b.addEventListener("click", () => loadLogTail(overlay, b.dataset.view)));
+  overlay.querySelector(".settings-export-logs")?.addEventListener("click", (e) => exportLogs(e.currentTarget));
 
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeLibraryEditor(); });
   // (status summary is filled in after the overlay is in the DOM, below)
@@ -2523,7 +4265,10 @@ function openLibraryEditor() {
   libraryEditor = overlay;
   refreshLibrarySyncSummary();
   const isDesktop = Boolean(window.__TAURI__?.core?.invoke);
+  wireLanguageSetting(overlay);
   wireGeneralSettings(overlay);
+  wireStemsLocation(overlay);
+  wireExportsLocation(overlay);
   wireNetworkSetting(overlay);
   if (!isDesktop) {
     overlay.querySelector(".net-access-input")?.setAttribute("disabled", "");
@@ -2531,7 +4276,7 @@ function openLibraryEditor() {
     overlay.querySelector(".set-port")?.setAttribute("disabled", "");
     const note = document.createElement("p");
     note.className = "settings-server-note";
-    note.textContent = "These settings are read-only in server mode. To change them, update your server configuration (e.g. docker-compose.yml) and restart.";
+    note.textContent = i18nT("settings.readOnlyServer");
     overlay.querySelector("[data-pane='network']")?.prepend(note);
   }
   // Reset app data (#312): originally a "session keeps coming back across
@@ -2575,28 +4320,18 @@ async function waitForJobTerminal(jobId) {
 async function resyncLibrary() {
   const statusEl = libraryEditor?.querySelector(".library-editor-status");
   const syncBtn = libraryEditor?.querySelector(".library-editor-sync");
-  if (statusEl) statusEl.textContent = "Syncing…";
+  if (statusEl) statusEl.textContent = i18nT("library.syncing");
   if (syncBtn) syncBtn.disabled = true;
 
   try {
     const res = await fetch("/api/jobs", { cache: "no-store" });
     if (!res.ok) throw new Error(`status ${res.status}`);
-    const jobs = await res.json();
-    const serverIds = new Set(jobs.map((j) => j.job_id));
 
-    await syncWithServer(); // forward: pull in any new server jobs
-
-    const trashIds = new Set(getTrashFolder()?.items || []);
-    for (const [id, t] of Object.entries(tracks)) {
-      if (trashIds.has(id)) continue;
-      if (t.status === "done" && !serverIds.has(id)) t.status = "unavailable";
-      else if (t.status === "unavailable" && serverIds.has(id)) t.status = "done";
-    }
-    saveState();
-    render();
+    await syncWithServer(); // pulls in new server jobs, reconciles done <-> unavailable
     if (libraryEditor) renderLibraryRows(libraryEditor.querySelector(".library-editor-body"));
 
     // Collect what's still unavailable; auto-restore the ones with a URL source.
+    const trashIds = new Set(getTrashFolder()?.items || []);
     const unavailable = Object.entries(tracks)
       .filter(([id, t]) => !trashIds.has(id) && t.status === "unavailable")
       .map(([, t]) => t);
@@ -2621,7 +4356,7 @@ async function resyncLibrary() {
     refreshLibrarySyncSummary();
   } catch (e) {
     console.warn("[catalog] resync failed:", e);
-    if (statusEl) statusEl.textContent = "Sync failed — check your connection.";
+    if (statusEl) statusEl.textContent = i18nT("library.syncFailed");
   } finally {
     if (syncBtn) syncBtn.disabled = false;
   }
@@ -2653,6 +4388,11 @@ export async function initCatalog() {
   setDisplayedVersion(currentVersion);
   render();
 
+  // Patch rows in place on every queue frame. A full render() here would
+  // rebuild the sidebar several times a second.
+  onQueueChange(onQueueFrame);
+  onJobSettled(completeSettledJob);
+  startQueueStream();
 
   loadCurrentVersion().finally(checkForUpdate);
   syncWithServer();

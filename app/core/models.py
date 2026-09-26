@@ -48,7 +48,14 @@ class Job:
     dynamic_range: float | None = None  # peak_db - integrated LUFS (dB)
     tempo_stability: int | None = None  # 0-100, beat interval consistency
     stem_presence: dict[str, int] | None = None  # per-stem RMS 0-100
-    sections: list[dict] | None = None  # [{id, name, start, end, color}]
+    sections: list[dict] | None = None  # [{id, name, kind?, start, end, color}]
+    # Whether this job should run the automatic song-structure pass, captured
+    # from the setting when the job is created rather than read when the stage
+    # is reached. The stage runs at the very end of the pipeline, minutes after
+    # submit, and the toggle is a per-import choice that clears itself: reading
+    # it late let a job lose a pass the user had asked and waited for.
+    auto_sections: bool = False
+    sections_source: Literal["automatic", "manual"] | None = None
     tags: list[str] | None = None  # YouTube tags + categories, lowercased, max 8
     stems: list[dict[str, str]] = field(default_factory=list)
     # Subset of stems the user chose at submit. The pipeline produces all
@@ -58,9 +65,25 @@ class Job:
     selected_stems: list[str] = field(default_factory=list)
     mix_url: str | None = None  # populated when a strict subset was selected
     source_url: str | None = None  # original URL or "local:<filename>" for file uploads
+    # An upload's file format ("wav", "mp3", ...), recorded from the extension
+    # the upload was validated against. source_url cannot carry it: its title
+    # has the extension removed, so "Hollow Veins.wav" is "local:Hollow Veins"
+    # and anything that read the format out of it found nothing (#690). None
+    # for a link, and for an upload older than this field until its state is
+    # first served (see _job_state).
+    source_format: str | None = None
     # True when a silent video track (video.mp4) was preserved from an .mp4
     # upload, enabling the "Export Mix (with video)" MP4 export.
     has_video: bool = False
+    # Why has_video is what it is (#436). None when video was never attempted
+    # (SoundCloud, a non-mp4 upload); "ok" when a track was preserved;
+    # "unavailable" when the source simply offers no video stream; "failed"
+    # when the fetch or extract errored.
+    #
+    # has_video alone collapses the last two into the same silent absence, so a
+    # user who imported a track specifically to export a karaoke video could not
+    # tell "this never had video" from "the video fetch broke".
+    video_status: str | None = None
     error: str | None = None
     # Classified failure cause + last stderr line (e.g. "out-of-memory — ...").
     # Shown by the UI as a secondary line under the generic error message so
@@ -76,6 +99,23 @@ class Job:
     # Wall-clock seconds per pipeline stage ({"download": 12.3, ...}); written
     # to metadata.json and the one-line completion summary in the log.
     stage_timings: dict[str, float] | None = None
+    # On-demand lead/backing vocal split (#275) -- a post-hoc action on an
+    # already-"done" job, not part of the main pipeline. "none" until the user
+    # asks for it; "error" leaves the job's base stems untouched (see
+    # app/pipeline/vocal_split.py) and is recorded in stems/vocal_split_error.txt,
+    # not job.error_detail, since the job itself did not fail.
+    vocal_split: Literal["none", "running", "done", "error"] = "none"
+    # When the user put this job in the Trash, or None if they have not.
+    #
+    # Server-side on purpose. The Trash used to live only in the browser's
+    # catalog store, which is per-device: a track deleted on the desktop was
+    # still returned by GET /api/jobs, so the phone -- which builds its library
+    # straight from that endpoint -- listed everything the user thought they
+    # had thrown away. Two UIs, two answers to "what is in my library".
+    #
+    # A timestamp rather than a bool so the Trash can say when, and so a future
+    # auto-purge has something to work from.
+    trashed_at: float | None = None
     # Set by POST /api/jobs/{id}/cancel; consumed by pipeline stages.
     # Not surfaced via to_state() -- it's internal control state.
     cancel_requested: bool = False
@@ -83,6 +123,15 @@ class Job:
     # tear-detection state for the SSE stream -- not surfaced via to_state()
     # or persisted, same as cancel_requested.
     version: int = 0
+    # Place in the waiting queue, rewritten whenever the queue changes. Only
+    # exists so a reordered queue comes back in the user's order rather than
+    # submission order after a restart; the position the UI shows is derived
+    # from the live deque. Old records default to 0, where created_at decides.
+    queue_position: int = 0
+    # How many times a restart has put this job back in the queue. Persisted,
+    # so a job that reliably kills the process is failed rather than retried on
+    # every start. Old records without the field default to 0 via from_record.
+    resume_attempts: int = 0
     # Wall-clock timestamps for metadata-based sweep -- more predictable
     # than directory mtime, which can be touched by unrelated FS events.
     created_at: float = field(default_factory=time.time)
@@ -106,18 +155,38 @@ class Job:
             "tempo_stability": self.tempo_stability,
             "stem_presence": self.stem_presence,
             "sections": self.sections,
+            "sections_source": self.sections_source,
             "tags": self.tags,
             "stems": self.stems,
             "selected_stems": self.selected_stems,
             "mix_url": self.mix_url,
             "source_url": self.source_url,
+            "source_format": self.source_format,
             "has_video": self.has_video,
+            "video_status": self.video_status,
             "error": self.error,
             "error_detail": self.error_detail,
             "compute_device": self.compute_device,
             "gpu_fallback": self.gpu_fallback,
             "stage_timings": self.stage_timings,
+            "vocal_split": self.vocal_split,
+            "trashed_at": self.trashed_at,
             "created_at": self.created_at,
+        }
+
+    def to_queue_state(self) -> dict[str, Any]:
+        """The compact record the queue view needs. Deliberately not to_state():
+        the queue stream carries every waiting job several times a second, and
+        stems/sections/analysis are only meaningful once a job is done."""
+        return {
+            "job_id": self.id,
+            "status": self.status,
+            "progress": self.progress,
+            "stage": self.stage_message,
+            "title": self.title,
+            "thumbnail": self.thumbnail,
+            "source_url": self.source_url,
+            "error": self.error,
         }
 
     def to_record(self) -> dict[str, Any]:

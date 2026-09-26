@@ -11,9 +11,9 @@ By participating you agree to follow our [Code of Conduct](CODE_OF_CONDUCT.md).
   Include your OS, the StemDeck version (Help icon -> About), and clear steps to reproduce.
 - **Suggest a feature** - open a [Feature request](https://github.com/stemdeckapp/stemdeck/issues/new/choose).
 - **Improve the docs** - fixes and clarifications to the README or these guides are always useful.
-- **Write code** - bug fixes and features. For anything large, please open an issue or a
-  [Discussion](https://github.com/stemdeckapp/stemdeck/discussions) first so we can agree on the
-  approach before you invest time.
+- **Write code** - bug fixes and features. StemDeck does not accept pull requests directly (see
+  below) - open an issue or a [Discussion](https://github.com/stemdeckapp/stemdeck/discussions)
+  first so we can agree on the approach before you invest time.
 - **Found a security issue?** Do not open a public issue - see [SECURITY.md](SECURITY.md).
 
 ## Project layout
@@ -57,14 +57,26 @@ uv run pytest tests/ -q              # backend tests
 
 For Rust changes in `desktop/`, also run `cargo fmt --check` and `cargo clippy -- -D warnings`.
 
-## Pull request guidelines
+## Contributing code without opening a pull request
 
-- Branch off `main`.
-- Use [Conventional Commits](https://www.conventionalcommits.org/) for messages
-  (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, `ci:`).
-- Open the PR as a **draft** until it is ready for review.
-- Keep PRs focused - one logical change per PR makes review faster.
-- Describe what changed and why, and how you tested it.
+StemDeck's CI runs on self-hosted infrastructure for some platforms, so pull requests from
+outside contributors are not accepted - a PR opened by anyone other than the maintainer will be
+closed unreviewed. This is not a comment on the change itself, just how this repo keeps untrusted
+code off its own machines.
+
+If you have a code change:
+
+1. Fork the repo and push your change to a branch on your fork.
+2. Open an **issue** describing the change, and include a link to your branch (or a compare URL
+   like `https://github.com/<you>/stemdeck/compare/main...<you>:stemdeck:<branch>`).
+3. The maintainer reviews the diff there. A public fork branch can be fetched and read without
+   any special access, so if it's a good fit, they'll pull it into a branch on this repo and take
+   it from there - no action needed on your end.
+
+Branch off `main`, use [Conventional Commits](https://www.conventionalcommits.org/) for messages
+(`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, `ci:`), keep the change focused, and
+describe what changed, why, and how you tested it in the issue - the same information a PR
+description would carry.
 
 ## Tests
 
@@ -79,4 +91,4 @@ contributions are licensed under the same terms.
 ## Questions
 
 Open a [Discussion](https://github.com/stemdeckapp/stemdeck/discussions) or join the
-[Discord](https://discord.gg/2MVsWqaPRe). Thanks for helping make StemDeck better.
+[Discord](https://discord.gg/YhCKsjhcwB). Thanks for helping make StemDeck better.

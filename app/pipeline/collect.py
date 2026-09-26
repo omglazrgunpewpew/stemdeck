@@ -74,8 +74,9 @@ _TERMINAL = frozenset(("done", "error", "cancelled"))
 def collect(job: Job, stems_root: Path, job_dir: Path) -> list[str]:
     """Move Demucs-emitted stems into the job's stems/ dir and clean up
     the demucs intermediate dir. Does NOT delete the source download --
-    cleanup_source() is called by the runner after any post-processing
-    that needs to re-encode the source (e.g. building original.wav)."""
+    cleanup_source() is called by the runner, for the jobs whose source
+    can be fetched again, after any post-processing that needs to
+    re-encode it (e.g. building original.wav)."""
     target_dir = job_dir / "stems"
     target_dir.mkdir(exist_ok=True)
     found: list[str] = []
@@ -94,7 +95,11 @@ def cleanup_source(job_dir: Path) -> None:
     """Delete the source audio file. Called after collect AND after any
     post-processing that re-encodes the source (make_original_track).
     The source is 100-300 MB, so getting rid of it is the bulk of disk
-    reclaim per job; only the stems remain."""
+    reclaim per job; only the stems remain.
+
+    Not called for uploads. The runner decides: a link can be fetched
+    again, an upload cannot, and deleting an upload's source destroys
+    the only copy StemDeck has of it."""
     for f in job_dir.glob("source.*"):
         f.unlink(missing_ok=True)
 
@@ -182,7 +187,11 @@ def make_selected_mix(job: Job, stems_dir: Path, found: list[str]) -> Path | Non
     return out if _run_ffmpeg(job, cmd) else None
 
 
-_PEAK_POINTS = 1500  # matches OVERVIEW_WAVE_POINTS in player.js
+# Enough points to back the deepest zoom, not the 1x bar count: a full-width
+# panel draws about 2400 bars at WAVE_ZOOM_MAX (10x, transport.js), and past
+# the point count the bars repeat their neighbours instead of revealing
+# anything. Raise this and WAVE_ZOOM_MAX together.
+_PEAK_POINTS = 3000
 
 
 def compute_stem_peaks(stems_dir: Path, stem_names: list[str]) -> dict[str, float]:
@@ -218,17 +227,94 @@ def compute_stem_peaks(stems_dir: Path, stem_names: list[str]) -> dict[str, floa
     return rms_values
 
 
-def sweep_old_jobs(jobs_dir: Path) -> None:
-    """Delete job directories older than JOB_TTL_SECONDS and remove them from
-    the in-memory registry. Called hourly from the background sweep loop
-    started at app startup.
+def merge_stem_peaks(stems_dir: Path, new_names: list[str]) -> dict[str, float]:
+    """Add peaks/RMS for newly-produced stems (e.g. the on-demand lead/backing
+    vocal split, #275) into the existing peaks.json instead of recomputing
+    every stem. Best-effort, same as compute_stem_peaks: a failure here only
+    costs client-side waveform decode for the new stems, never the job.
+
+    Returns each scanned stem's RMS, from the same pass, so the caller can
+    extend stem presence without decoding anything twice (see
+    presence_for_split)."""
+    path = stems_dir / "peaks.json"
+    peaks: dict[str, list[list[float]]] = {}
+    rms_values: dict[str, float] = {}
+    if path.is_file():
+        try:
+            peaks = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("could not read existing peaks.json in %s", stems_dir, exc_info=True)
+
+    for name in new_names:
+        wav = stems_dir / f"{name}.wav"
+        if not wav.is_file():
+            continue
+        try:
+            result, rms = scan_stem(wav, _PEAK_POINTS)
+            rms_values[name] = rms
+            if result:
+                peaks[name] = result
+        except Exception:
+            logger.warning("could not compute peaks for %s/%s", stems_dir.name, name, exc_info=True)
+
+    try:
+        tmp = stems_dir / "peaks.json.tmp"
+        tmp.write_text(json.dumps(peaks), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        logger.warning("could not write peaks.json for %s", stems_dir.name, exc_info=True)
+
+    return rms_values
+
+
+def presence_for_split(
+    rms_values: dict[str, float],
+    stem_presence: dict[str, int] | None,
+    *,
+    reference: str = "vocals",
+) -> dict[str, int]:
+    """Put the lead/backing stems on the same 0-100 scale the pipeline already
+    recorded for the base six.
+
+    Presence is a stem's RMS as a percentage of the loudest stem in the job,
+    and that loudest value is not stored anywhere -- only the percentages are.
+    It can be recovered exactly from any stem whose presence is known:
+
+        loudest = rms[reference] / (presence[reference] / 100)
+
+    So scanning the reference stem alongside the new ones is enough, and the
+    alternative (re-decoding all eight stems to renormalise) is avoided.
+
+    Returns an empty dict when the reference is missing or silent, which leaves
+    the new cards reading "--" rather than showing a number derived from
+    nothing."""
+    reference_rms = rms_values.get(reference)
+    reference_pct = (stem_presence or {}).get(reference)
+    if not reference_rms or not reference_pct:
+        return {}
+    loudest = reference_rms / (reference_pct / 100)
+    if loudest < 1e-9:
+        return {}
+    return {
+        name: max(0, min(100, round(rms / loudest * 100)))
+        for name, rms in rms_values.items()
+        if name != reference
+    }
+
+
+def sweep_old_jobs(jobs_dir: Path, ttl_seconds: int | None = None) -> None:
+    """Delete job directories older than `ttl_seconds` (JOB_TTL_SECONDS when
+    not given) and remove them from the in-memory registry. Called hourly from
+    the background sweep loop started at app startup, and only when the user
+    has asked for automatic deletion -- deciding *whether* to sweep is the
+    caller's job, this one only decides what is old.
 
     Prefers Job.created_at over directory mtime (which can be touched by
     unrelated filesystem events), and never deletes the directory of an
     active (non-terminal) registered job even if its timestamp looks old.
     Falls back to mtime for orphan directories left over from a previous
     server run, since the registry is in-memory only."""
-    cutoff = time.time() - JOB_TTL_SECONDS
+    cutoff = time.time() - (JOB_TTL_SECONDS if ttl_seconds is None else ttl_seconds)
     if not jobs_dir.is_dir():
         return
     jobs = registry_all()

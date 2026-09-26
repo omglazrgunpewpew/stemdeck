@@ -84,6 +84,51 @@ function startProgressStatus(messages) {
   return () => window.clearInterval(timer);
 }
 
+/**
+ * Real progress for the pip passes that install CUDA acceleration.
+ *
+ * Those passes move several GB, and until the backend streamed pip's output
+ * there was nothing to show but a timer counting up, which reads exactly like
+ * the freeze it replaced (#502). The timed messages stay as the opening line
+ * and as the fallback for a machine that has everything cached and never
+ * downloads anything; the first real byte count takes over from them.
+ *
+ * Returns a stop function that unregisters the listener and hides the bar.
+ */
+async function startPipProgress(stopTimedMessages) {
+  const progressWrap = document.getElementById("progress-wrap");
+  const progressFill = document.getElementById("progress-fill");
+  let tookOver = false;
+
+  const unlisten = await window.__TAURI__.event.listen("setup-progress", (event) => {
+    const { detail, received, total } = event.payload ?? {};
+    // Only now is there something truthful to show, so this is where the
+    // elapsed-time messages are retired rather than up front.
+    if (!tookOver) {
+      tookOver = true;
+      stopTimedMessages();
+      progressWrap.classList.remove("hidden");
+    }
+    if (Number.isFinite(received) && Number.isFinite(total) && total > 0) {
+      const pct = Math.min(100, Math.round((received / total) * 100));
+      progressFill.style.width = `${pct}%`;
+      progressFill.classList.remove("indeterminate");
+      setStatus(`${detail}... ${(received / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB`);
+    } else {
+      // Resolving, or installing what it already fetched. Real work with no
+      // measurable size, which is what indeterminate is for.
+      progressFill.classList.add("indeterminate");
+      setStatus(`${detail}...`);
+    }
+  });
+
+  return () => {
+    unlisten();
+    progressWrap.classList.add("hidden");
+    progressFill.classList.remove("indeterminate");
+  };
+}
+
 function isMac() {
   return /mac/i.test(navigator.userAgentData?.platform ?? navigator.platform ?? "");
 }
@@ -210,6 +255,40 @@ async function installRuntimePack(appRoot) {
   }
 }
 
+// What to tell someone whose FFmpeg step just failed.
+//
+// This used to be one sentence about networks and firewalls, attached to every
+// failure of the step. That is right for a download that did not arrive, and
+// actively misleading for a download that arrived and then would not run: a
+// reporter on an Apple Silicon Mac was told to check their firewall when the
+// binary they had was built for Intel (#637).
+//
+// macOS reports that case as EBADARCH, "Bad CPU type in executable (os error
+// 86)". It happens when the per-architecture primary source is unreachable and
+// the fallback, which publishes Intel builds only, is used instead. Rosetta
+// normally papers over it, but a bare exec() never triggers Rosetta's
+// install-on-demand prompt, so a Mac without it just fails.
+function ffmpegFailureHint(message) {
+  const wrongArchitecture = /bad cpu type|os error 86|EBADARCH/i.test(message);
+  if (wrongArchitecture) {
+    return (
+      "The FFmpeg that was downloaded is built for a different kind of Mac than yours, " +
+      "so it cannot run. This happens when the Apple Silicon download source is " +
+      "unreachable and StemDeck falls back to an Intel-only build. Two ways out: " +
+      'install Rosetta with "softwareupdate --install-rosetta" in Terminal, which lets ' +
+      "Intel builds run, or point StemDeck at a matching build by setting the " +
+      "STEMDECK_FFMPEG_URL environment variable before launching. Deleting the ffmpeg " +
+      "folder in StemDeck's data directory before retrying lets it fetch a fresh copy."
+    );
+  }
+  return (
+    "If this keeps failing, your network or firewall may be blocking the FFmpeg " +
+    "download server. You can point StemDeck at a different FFmpeg build by " +
+    "setting the STEMDECK_FFMPEG_URL environment variable before launching, then " +
+    "retrying."
+  );
+}
+
 async function runSetup() {
   detailsEl.classList.add("hidden");
   retryBtn.classList.add("hidden");
@@ -311,6 +390,15 @@ async function runSetup() {
               "FFmpeg setup did not complete. Check your internet connection and retry."
             );
           }
+        } catch (err) {
+          // showError (the outer catch-all) reads error.hint, so attach one
+          // here rather than only in the generic path -- a network/firewall
+          // block on the FFmpeg host is common enough (and retrying alone
+          // won't fix it) to deserve a specific next step, not just "retry".
+          const message = String(err?.message ?? err);
+          const wrapped = new Error(message);
+          wrapped.hint = ffmpegFailureHint(message);
+          throw wrapped;
         } finally {
           stopProgress();
         }
@@ -350,6 +438,8 @@ async function runSetup() {
               },
             ]
       );
+      // macOS never runs a pip pass here, so there is nothing to listen for.
+      const stopPipProgress = macGPU ? null : await startPipProgress(stopProgress);
 
       try {
         const gpu = await invoke("ensure_torch_device");
@@ -373,11 +463,63 @@ async function runSetup() {
         return gpu;
       } finally {
         stopProgress();
+        stopPipProgress?.();
       }
     });
 
-    setStep("model", "done");
-    setStatus("AI separation model will download on first use (~340 MB).");
+    await runStep("model", async () => {
+      const stopProgress = startProgressStatus([
+        {
+          afterSeconds: 0,
+          text: "Downloading AI models... this can take a few minutes on first run.",
+        },
+        {
+          afterSeconds: 60,
+          text: "Still downloading AI models... slow networks can delay this.",
+        },
+        {
+          afterSeconds: 300,
+          text: "Still working... large models can take a while on a slow connection.",
+        },
+      ]);
+      try {
+        // Best-effort, per model: any model that doesn't download here just
+        // falls back to its existing lazy-download-on-first-use behavior --
+        // never fails setup over this (warmup_models itself never throws for
+        // an individual model failure; this catch is only for the whole
+        // subprocess failing to run at all, e.g. a missing Python).
+        //
+        // The per-model result was thrown away here, so a user whose beat
+        // model never arrived saw a clean setup and then a permanently worse
+        // beat grid, with nothing anywhere connecting the two (#502). Naming
+        // it at least puts it in the log that gets attached to bug reports.
+        //
+        // Deliberately not setStatus: the next step overwrites the status line
+        // immediately and then navigates away to the backend, so anything
+        // written here is invisible. Telling the user properly belongs in the
+        // main UI, where the affected feature actually lives, and is its own
+        // piece of work.
+        // camelCase, because ModelWarmupStatus is #[serde(rename_all =
+        // "camelCase")]. Reading the Rust field names instead gives four
+        // undefineds, `missing` is empty every time, and this says nothing.
+        const status = await invoke("warmup_models");
+        const missing = [
+          [status?.demucsReady, "stem separation"],
+          [status?.beatThisReady, "beat detection"],
+          [status?.sectionsReady, "song sections"],
+          [status?.vocalSplitReady, "karaoke split"],
+        ]
+          .filter(([ready]) => ready === false)
+          .map(([, label]) => label);
+        if (missing.length) {
+          console.warn("models not downloaded during setup:", missing.join(", "));
+        }
+      } catch (err) {
+        console.warn("model warmup failed (will download lazily on first use):", err);
+      } finally {
+        stopProgress();
+      }
+    });
 
     await runStep("backend", async () => {
       setStatus(gpuSummary ? `${gpuSummary} - starting backend...` : "Starting StemDeck backend...");

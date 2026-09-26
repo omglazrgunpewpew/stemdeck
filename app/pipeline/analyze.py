@@ -161,12 +161,17 @@ def _measure_loudness(y: object, sr: int) -> tuple[float | None, float | None]:
 
 
 def _load_audio_ffmpeg(
-    source: Path, sr: int = 22050, duration: float = 180.0
+    source: Path,
+    sr: int = 22050,
+    duration: float | None = 180.0,
+    timeout: int = TIMEOUT_ANALYZE,
 ) -> tuple[object, int] | None:
     """Decode `source` to a mono float32 numpy array at `sr` via ffmpeg.
     Bypasses librosa's deprecated audioread fallback (which fires a
     FutureWarning on .webm/.m4a/.opus inputs because soundfile can't
-    read those directly). Returns (samples, sr) or None on failure."""
+    read those directly). `duration=None` decodes the whole file (used by
+    the beat-grid stage, which must cover the full track). Returns
+    (samples, sr) or None on failure."""
     import numpy as np
 
     # Defence in depth: even though `source` is constructed by the server
@@ -199,13 +204,19 @@ def _load_audio_ffmpeg(
         str(sr),  # resample
         "-f",
         "f32le",  # raw 32-bit float little-endian
-        "-t",
-        str(duration),  # cap input duration
-        "-",  # write to stdout
     ]
+    if duration is not None:
+        cmd += ["-t", str(duration)]  # cap input duration
+    cmd.append("-")  # write to stdout
     try:
-        proc = subprocess.run(cmd, capture_output=True, check=True, timeout=TIMEOUT_ANALYZE)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        proc = subprocess.run(cmd, capture_output=True, check=True, timeout=timeout)
+    # OSError, not just FileNotFoundError. A missing binary is only one way
+    # spawning fails: a portable install whose ffmpeg lost its executable bit
+    # raises PermissionError, which is an OSError but not a FileNotFoundError,
+    # and would have crashed the analysis instead of degrading. Everything this
+    # function produces is a display field, so None is always the right answer
+    # on failure.
+    except (subprocess.SubprocessError, OSError) as e:
         logger.warning("ffmpeg decode failed for %s: %s", source, e)
         return None
     y = np.frombuffer(proc.stdout, dtype=np.float32)
