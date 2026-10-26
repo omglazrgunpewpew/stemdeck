@@ -24,6 +24,13 @@ On October 26, the owner selected "Raise the minimum to Python 3.11 (Recommended
 - The initial `pip-audit` dependency-resolution attempt for the Linux-target requirements file ran on Windows and could not resolve `nvidia-nccl-cu12==2.21.5`. The pinned Linux graph was then audited with `pip-audit --no-deps --disable-pip`, which passed with the existing policy. The Linux CI audit remains the full resolver gate.
 - `cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml` cannot complete on this host because the Visual Studio linker cannot find `msvcrt.lib` (LNK1104). `cargo fmt --check`, locked Cargo metadata, and `cargo tree -i rustls` provide local coverage. The Windows CI `rust-check` remains the build gate.
 
+## Native CI Follow-Up
+
+- The hosted Windows `rust-check` at candidate `e98c25709ffba75baa5a5249a85298ceb821036c` failed in `tauri-runtime-wry 2.11.4` with two distinct `ICoreWebView2Environment` types. The hosted Linux `check` failed in the same crate because its `available_monitors` and `primary_monitor` trait methods had return types inconsistent with the resolved `tauri-runtime`.
+- The lockfile paired `tauri 2.11.1` and `tauri-runtime-wry 2.11.4` with `tauri-runtime 2.12.0`. The `tauri-runtime-wry 2.11.4` crate metadata requires `tauri-runtime ^2.11.3` and selects WebView2 0.38 and Windows 0.61. The `tauri-runtime 2.12.0` metadata selects WebView2 0.39 and Windows 0.62.
+- The follow-up lock update aligns `tauri`, `tauri-runtime`, and `tauri-runtime-wry` at 2.12.0. Their resolved native backend now uses `tauri-runtime-wry 2.12.0`, `wry 0.57.1`, `tao 0.37.2`, WebView2 0.39.1, and Windows Core 0.62.2. This addresses the mismatched crate families shown in the hosted logs without changing application source or manifest APIs.
+- Local validation for this follow-up: `cargo fetch --locked`, `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check`, locked metadata, and inverse dependency trees pass. A local native compile remains unavailable because `msvcrt.lib` is missing. Hosted Linux and Windows compile checks must pass on the frozen follow-up candidate before merge.
+
 ## Validation
 
 - `uv lock --check`: passed.
