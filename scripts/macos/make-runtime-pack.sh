@@ -24,7 +24,7 @@ fi
 
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [[ -z "$PYTHON_BIN" ]]; then
-  for candidate in python3.12 python3.11 python3.10 python3; do
+  for candidate in python3.12 python3.11 python3; do
     if command -v "$candidate" >/dev/null 2>&1; then
       PYTHON_BIN="$candidate"
       break
@@ -50,13 +50,19 @@ print(platform.machine())
 PY
 )"
 case "$PYTHON_VERSION" in
-  3.10|3.11|3.12|3.13) ;;
+  3.11|3.12|3.13) ;;
   *)
-    echo "ERROR: ${PYTHON_BIN} is Python ${PYTHON_VERSION}; Torch 2.6 runtime builds require Python 3.10-3.13." >&2
+    echo "ERROR: ${PYTHON_BIN} is Python ${PYTHON_VERSION}; StemDeck runtime builds require Python 3.11-3.13." >&2
     echo "Set PYTHON_BIN=/path/to/python3.12 or PYTHON_BIN=/path/to/python3.11." >&2
     exit 1
     ;;
 esac
+
+if [[ "$ARCH" == "x64" && "$PYTHON_VERSION" == "3.13" ]]; then
+  echo "ERROR: Intel macOS runtime builds require Python 3.11 or 3.12 for the supported Torch wheels." >&2
+  echo "Set PYTHON_BIN=/path/to/python3.12 or PYTHON_BIN=/path/to/python3.11." >&2
+  exit 1
+fi
 
 HOST_ARCH="$(uname -m)"
 if [[ "$ARCH" == "arm64" && "$PYTHON_MACHINE" != "arm64" ]]; then
