@@ -31,15 +31,17 @@ jobs:
     # macos-check.yml. cargo build/clippy/test execute whatever the PR supplies
     # (build.rs, proc-macro crates, a swapped Cargo.toml dependency, the test
     # bodies), nothing here cleans the workspace, and this runner also builds
-    # the Windows release. Fork PRs get a maintainer-triggered
-    # workflow_dispatch run instead.
+    # the Windows release. In the canonical repository, fork PRs stay blocked
+    # and a maintainer can run workflow_dispatch after review. The personal fork
+    # selects GitHub-hosted runners below for its same-repository PRs.
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    # Runner must have rustup and the MSVC toolchain (same requirements as
-    # windows-release.yml, which this intentionally does not replace -- this
-    # only builds/checks, never packages or uploads anything).
-    runs-on: [self-hosted, windows, x64]
+    # The canonical repository keeps its self-hosted Windows x64 runner with
+    # rustup and the MSVC toolchain (same requirements as windows-release.yml).
+    # This check never packages or uploads anything. The personal fork has no
+    # self-hosted runners, so it uses GitHub's hosted Windows x64 runner.
+    runs-on: ${{ github.repository == 'omglazrgunpewpew/stemdeck' && 'windows-latest' || fromJSON('["self-hosted", "windows", "x64"]') }}
     timeout-minutes: 30
     defaults:
       run:

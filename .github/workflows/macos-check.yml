@@ -34,16 +34,17 @@ jobs:
     # ~/.rustup or the persistent _work tree would survive into the next
     # release. permissions: {} limits the token, not code execution.
     #
-    # GitHub's public-repo default only gates *first-time* contributors, so one
-    # trivial merged PR is enough to unlock this for a later one. Fork PRs get a
-    # maintainer-triggered workflow_dispatch run instead.
+    # In the canonical repository, fork PRs stay blocked and a maintainer can
+    # run workflow_dispatch after review. The personal fork selects GitHub-hosted
+    # runners below, so its same-repository PRs can run these checks.
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    # Runner must be darwin/arm64 with Xcode CLT and rustup (same requirements
-    # as macos-release.yml, which this intentionally does not replace -- this
-    # only builds/checks, never signs, packages, or uploads anything).
-    runs-on: [self-hosted, macOS, ARM64]
+    # The canonical repository keeps its darwin/arm64 self-hosted runner, with
+    # Xcode CLT and rustup (same requirements as macos-release.yml). This check
+    # never signs, packages, or uploads anything. The personal fork has no
+    # self-hosted runners, so it uses GitHub's hosted Apple Silicon runner.
+    runs-on: ${{ github.repository == 'omglazrgunpewpew/stemdeck' && 'macos-latest' || fromJSON('["self-hosted", "macOS", "ARM64"]') }}
     timeout-minutes: 30
     defaults:
       run:
