@@ -29,7 +29,14 @@ On October 26, the owner selected "Raise the minimum to Python 3.11 (Recommended
 - The hosted Windows `rust-check` at candidate `e98c25709ffba75baa5a5249a85298ceb821036c` failed in `tauri-runtime-wry 2.11.4` with two distinct `ICoreWebView2Environment` types. The hosted Linux `check` failed in the same crate because its `available_monitors` and `primary_monitor` trait methods had return types inconsistent with the resolved `tauri-runtime`.
 - The lockfile paired `tauri 2.11.1` and `tauri-runtime-wry 2.11.4` with `tauri-runtime 2.12.0`. The `tauri-runtime-wry 2.11.4` crate metadata requires `tauri-runtime ^2.11.3` and selects WebView2 0.38 and Windows 0.61. The `tauri-runtime 2.12.0` metadata selects WebView2 0.39 and Windows 0.62.
 - The follow-up lock update aligns `tauri`, `tauri-runtime`, and `tauri-runtime-wry` at 2.12.0. Their resolved native backend now uses `tauri-runtime-wry 2.12.0`, `wry 0.57.1`, `tao 0.37.2`, WebView2 0.39.1, and Windows Core 0.62.2. This addresses the mismatched crate families shown in the hosted logs without changing application source or manifest APIs.
-- Local validation for this follow-up: `cargo fetch --locked`, `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check`, locked metadata, and inverse dependency trees pass. A local native compile remains unavailable because `msvcrt.lib` is missing. Hosted Linux and Windows compile checks must pass on the frozen follow-up candidate before merge.
+- Local validation for this follow-up: `cargo fetch --locked`, `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check`, locked metadata, and inverse dependency trees pass. A local native compile remains unavailable because `msvcrt.lib` is missing. The hosted Linux Rust check and Windows `rust-check` passed on dependency candidate `eff380151a3c11ac3335161356340e1e21ab060d`. The platform-specific macOS and Windows check workflows still need passing results on the runner-selection candidate.
+
+## Fork Native Runner Follow-Up
+
+- The native macOS and Windows check workflows on dependency candidate `eff380151a3c11ac3335161356340e1e21ab060d` remained queued because the personal fork has no registered self-hosted runners, confirmed by the GitHub runner API.
+- Both native check workflows now select GitHub-hosted runners only when `github.repository` is `omglazrgunpewpew/stemdeck`: `macos-latest` for macOS ARM64 and `windows-latest` for Windows x64. The canonical repository retains the original self-hosted runner label arrays, the existing pull-request guard, empty token permissions, commands, and workflow triggers.
+- GitHub's [hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) documents `macos-latest` as ARM64 and `windows-latest` as x64. This fallback runs build and check commands only. It does not sign, package, or upload releases.
+- The workflow change requires fresh hosted `macos-check` and `windows-check` results on its exact candidate before merge. Existing dependency-candidate results do not validate these runner-selection edits.
 
 ## Validation
 
